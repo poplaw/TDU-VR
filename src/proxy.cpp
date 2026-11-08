@@ -388,6 +388,32 @@ static void cull_hooks() {
     }
 }
 
+// ---- more traffic (2007 exe) ----
+// TDU keeps its AI settings in one static block (0x143f720), filled by its startup script and the AI config
+// file: the vehicle caps (+4 all AI vehicles, +8 traffic: 8 each; the script commands clamp them to 16, and
+// the vehicle code has fixed pools of 16 slots) and up to 6 AI zones (+0x1c4, 0x114 apart, count at +0x83c),
+// each with a traffic density at +0x110 (cars per lane-km: 3-4). The traffic pool wants the lane length of
+// the roads around you times the zone's density, capped at the traffic cap: 3 cars parked at the house.
+// Here the caps are doubled (at most 16) and the densities multiplied by 5; whatever the game writes later
+// (a level load reads the AI config again) is scaled again.
+static void more_traffic() {
+    char* ai = (char*)0x143f720;
+    static int capSet[2];
+    for (int k = 0; k < 2; k++) {
+        int* c = (int*)(ai + 4 + 4 * k);
+        if (*c == capSet[k]) continue;
+        int was = *c;
+        capSet[k] = *c = was < 8 ? 2 * was : 16;
+        log_printf("traffic: %s cap %d -> %d\n", k ? "traffic" : "AI vehicle", was, *c);
+    }
+    static float densSet[6];
+    int n = *(const int*)(ai + 0x83c);
+    for (int i = 0; i < n && i < 6; i++) {
+        float* d = (float*)(ai + 0x1c4 + i * 0x114 + 0x110);
+        if (*d != densSet[i]) densSet[i] = *d *= 5;
+    }
+}
+
 static Slot g_slot[2];
 static UINT g_copyW, g_copyH;
 static D3DFORMAT g_copyFmt;
@@ -1684,6 +1710,7 @@ static void on_present(IDirect3DDevice9* d) {
         drawlog_present();
         static bool cullOff = GetEnvironmentVariableA("TDUVR_NOCULLFIX", nullptr, 0) > 0;  // test: the game's own culling
         if ((!g_cullOrig || !g_setFovOrig) && g_knownExe && !cullOff) cull_hooks();  // retried until SecuROM has decrypted the code
+        if (g_knownExe) more_traffic();
     } else {
         g_frame++;
     }
