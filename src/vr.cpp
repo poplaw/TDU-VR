@@ -96,7 +96,9 @@ void log_printf(const char* fmt, ...) {
 }
 
 float vr_ini_float(const char* key, float def) {
-    char buf[32], d[32];
+    char buf[32], d[32], env[64];
+    snprintf(env, sizeof env, "TDUVR_INI_%s", key);  // test override, e.g. TDUVR_INI_AutoDrive=0
+    if (GetEnvironmentVariableA(env, buf, sizeof buf) > 0) return (float)atof(buf);
     snprintf(d, sizeof d, "%g", def);
     GetPrivateProfileStringA("VR", key, d, buf, sizeof buf, (game_dir() + "tdu_vr.ini").c_str());
     return (float)atof(buf);

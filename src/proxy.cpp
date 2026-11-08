@@ -7,7 +7,6 @@
 #include <d3d9.h>
 #include <algorithm>
 #include <unordered_map>
-#include <unordered_set>
 #include <set>
 #include <vector>
 #include "ctab.h"
@@ -33,8 +32,6 @@ static D3DVIEWPORT9 g_vp;
 // distance in meters from tdu_vr.ini. g_uiU maps the 2D draw onto it for the current eye.
 static float g_uiFov = 70.0f, g_uiDist = 1.5f;
 static Mat4 g_uiU;
-static std::unordered_set<const void*> g_rtTex;  // the game's render-target textures (post-processing inputs)
-static const void* g_tex0;                       // texture bound to stage 0
 
 static float g_vsc[MAXC][4];     // what the game last set (shadow)
 static bool g_isMod[MAXC];       // hardware register currently holds our rewritten value
@@ -258,6 +255,84 @@ static bool headlook_verify() {
         return false;
     }
 }
+
+// ---- the game's sphere cull (0x50b3b0) ----
+// A camera method (thiscall: center, radius -> 0 outside, 1 inside, 2 crossing): the center goes through
+// the camera's view (+0x30), then |x| and |y| (both scaled by 1/aspect at +0xbc) are tested against
+// tan/cos/sin of half the vertical FOV (+0x20/+0x18/+0x1c): about 44 deg around where the camera looks.
+// The game culls cars with it (spheres of 2.2-2.8 m, from 0x8bb52d and 0x96ac2c), and buildings and
+// terrain sectors. The headset shows up to 55 deg (Quest 3), and past the head-look limits the camera
+// stops following the head: cars beside you vanished, so you drove into them. For the main view, an
+// object now also counts as visible when it is inside a cone around this frame's eye (the camera's
+// view times invEye) as wide as the eye's frustum plus a margin. Other cameras (reflection cube faces,
+// shadows) keep the game's test.
+typedef int(__fastcall* CullFn)(const char* cam, void* edx, const float* center, float radius);
+static CullFn g_cullOrig;                                     // trampoline: the overwritten instructions, then a jump back
+static const char* const kMainCam = (const char*)0x13a67e0;  // the game's copy of the camera it draws the main view with
+static unsigned g_cullN, g_cullBack;                         // main-view tests / objects only the eye's cone kept (status line)
+
+// The game keeps the main camera in several copies (world and render-relative coordinates): same rotation and FOV.
+static bool main_view(const char* cam) {
+    const float* a = (const float*)(cam + 0x30);
+    const float* b = (const float*)(kMainCam + 0x30);
+    for (int i = 0; i < 12; i++)
+        if ((i & 3) != 3 && std::fabs(a[i] - b[i]) > 1e-3f) return false;
+    return std::fabs(*(const float*)(cam + 0x10) - *(const float*)(kMainCam + 0x10)) < 1e-3f;
+}
+
+static int __fastcall hCull(const char* cam, void* edx, const float* c, float r) {
+    int game = g_cullOrig(cam, edx, c, r);
+    if (game == 1 || !main_view(cam)) return game;
+    static const float tanW = [] {  // widest eye tangent + 5 deg for head motion until the frame is shown
+        float t = -g_ev.l > g_ev.r ? -g_ev.l : g_ev.r, v = g_ev.up > g_ev.down ? g_ev.up : g_ev.down;
+        return tanf(atanf(t > v ? t : v) + 5 * 3.14159265f / 180);
+    }();
+    alignas(16) char eye[0xc0];  // the test reads +0x18..+0x20, the view at +0x30 and +0xbc
+    memcpy(eye, cam, sizeof eye);
+    Mat4 V;
+    memcpy(V.m, cam + 0x30, sizeof V.m);
+    Mat4 E = m4_mul(V, g_ev.invEye);
+    memcpy(eye + 0x30, E.m, sizeof E.m);
+    float cs = 1 / sqrtf(1 + tanW * tanW);
+    *(float*)(eye + 0x18) = cs;
+    *(float*)(eye + 0x1c) = tanW * cs;
+    *(float*)(eye + 0x20) = tanW;
+    *(float*)(eye + 0xbc) = 1;  // the same angle on both axes
+    int res = g_cullOrig(eye, edx, c, r);
+    g_cullN++;
+    if (!game && res) g_cullBack++;
+    return res ? res : game;
+}
+
+// True once hooked. The code is SecuROM-encrypted in the file, so it is checked in memory first.
+static bool cull_hook() {
+    static const unsigned char head[] = { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x83, 0xEC, 0x1C };  // push ebp; mov ebp,esp; and esp,-16; sub esp,0x1c
+    unsigned char* f = (unsigned char*)0x50b3b0;
+    __try {
+        if (memcmp(f, head, sizeof head)) return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    unsigned char* t = (unsigned char*)VirtualAlloc(nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!t) return false;
+    memcpy(t, f, 6);  // push ebp; mov ebp,esp; and esp,-16
+    t[6] = 0xE9;
+    *(LONG*)(t + 7) = (LONG)((f + 6) - (t + 11));
+    g_cullOrig = (CullFn)t;
+    unsigned char patch[8];
+    memcpy(patch, f, 8);
+    patch[0] = 0xE9;
+    *(LONG*)(patch + 1) = (LONG)((unsigned char*)hCull - (f + 5));
+    patch[5] = 0x90;
+    DWORD old;
+    VirtualProtect(f, 8, PAGE_EXECUTE_READWRITE, &old);
+    InterlockedExchange64((volatile LONG64*)f, *(LONG64*)patch);  // one aligned write: no thread sees half of it
+    VirtualProtect(f, 8, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), f, 8);
+    log_printf("cull: main view tested against the eye's frustum\n");
+    return true;
+}
+
 static Slot g_slot[2];
 static UINT g_copyW, g_copyH;
 static D3DFORMAT g_copyFmt;
@@ -280,8 +355,6 @@ struct DevOrig {
     decltype(IDirect3DDevice9Vtbl::SetVertexShaderConstantF) SetVertexShaderConstantF;
     decltype(IDirect3DDevice9Vtbl::SetRenderTarget) SetRenderTarget;
     decltype(IDirect3DDevice9Vtbl::SetViewport) SetViewport;
-    decltype(IDirect3DDevice9Vtbl::CreateTexture) CreateTexture;
-    decltype(IDirect3DDevice9Vtbl::SetTexture) SetTexture;
     decltype(IDirect3DDevice9Vtbl::DrawPrimitive) DrawPrimitive;
     decltype(IDirect3DDevice9Vtbl::DrawIndexedPrimitive) DrawIndexedPrimitive;
     decltype(IDirect3DDevice9Vtbl::DrawPrimitiveUP) DrawPrimitiveUP;
@@ -421,6 +494,11 @@ static void log_status() {
         g_capSum[0] = g_capSum[1] = 0;
         g_capN[0] = g_capN[1] = 0;
         g_earlyBad[0] = g_earlyBad[1] = 0;
+    }
+    if (g_cullOrig && frames) {
+        log_printf("  cull: %.1f main-view tests per frame the game's cone didn't pass whole, %.1f of them kept by the eye's cone\n",
+                   g_cullN / (double)frames, g_cullBack / (double)frames);
+        g_cullN = g_cullBack = 0;
     }
     last = t; lastFrame = g_frame; lastDraw = g_cnt[C_DRAW]; lastWait = g_copyWaitMs; lastSubmit = g_submitMs; lastApply = g_applyMs;
 }
@@ -911,14 +989,53 @@ static bool rewrite_still_valid(const ShaderMats* s) {
     return true;
 }
 
+// Post-processing quads read the game's own render targets and must keep covering the frame. They are
+// drawn without the depth test, while all of the game's 2D tests depth (tiny z): that includes the
+// minimap, which reads a render target of its own (the map), and menu parts drawn from render targets.
+// (Asks the bound texture itself: on D3D9On12 some of the game's render targets never came through
+// CreateTexture's hook, so a list of them missed the full-screen pass.)
+static bool postfx_pass(IDirect3DDevice9* d) {
+    IDirect3DBaseTexture9* t = nullptr;
+    if (FAILED(d->lpVtbl->GetTexture(d, 0, &t)) || !t) return false;
+    D3DSURFACE_DESC sd{};
+    if (t->lpVtbl->GetType(t) == D3DRTYPE_TEXTURE) ((IDirect3DTexture9*)t)->lpVtbl->GetLevelDesc((IDirect3DTexture9*)t, 0, &sd);
+    t->lpVtbl->Release(t);
+    DWORD z;
+    return (sd.Usage & D3DUSAGE_RENDERTARGET) && (FAILED(d->lpVtbl->GetRenderState(d, D3DRS_ZENABLE, &z)) || !z);
+}
+
+// The virtual screen's edges: what the game draws past the edge of its screen ("chat", parked menu parts)
+// is out of sight on a monitor, but around the virtual screen it would show. Four clip planes cut 2D
+// draws at the screen's edges: for the draw's own clip position c, -w <= x, y <= w; the rewritten draw
+// outputs c' = c * g_uiU, so each plane p becomes inverse(g_uiU) * p.
+static bool g_uiClip;       // clip planes enabled (only around 2D draws on the virtual screen)
+static unsigned g_uiClipGen;  // eye matrices the planes were set for
+
+static void ui_clip(IDirect3DDevice9* d, bool on) {
+    if (on && g_uiClipGen != g_eyeGen) {
+        g_uiClipGen = g_eyeGen;
+        Mat4 inv;
+        if (!m4_inverse(g_uiU, inv)) return;
+        static const float edge[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };  // x >= -w, x <= w, y >= -w, y <= w
+        for (int k = 0; k < 4; k++) {
+            float p[4];
+            for (int i = 0; i < 4; i++) p[i] = inv.m[i][0] * edge[k][0] + inv.m[i][1] * edge[k][1] + inv.m[i][3];
+            d->lpVtbl->SetClipPlane(d, k, p);
+        }
+    }
+    if (on == g_uiClip) return;
+    g_uiClip = on;
+    d->lpVtbl->SetRenderState(d, D3DRS_CLIPPLANEENABLE, on ? 0xF : 0);
+}
+
 // A full-screen 2D draw (menu, HUD, cursor): move it onto the virtual screen for this eye.
-// Post-processing quads read the game's own render targets and must keep covering the frame.
 static void ui_screen(IDirect3DDevice9* d, const ShaderMats* s) {
     restore_stale(d, nullptr);
-    if (g_tex0 && g_rtTex.count(g_tex0)) { g_st[R_POSTFX]++; return; }
+    if (postfx_pass(d)) { g_st[R_POSTFX]++; return; }
     g_st[R_UI]++;
     for (auto& m : s->mats)
         if (m.kind == MK_POST_K || m.kind == MK_PROJ) write_mat(d, m, m4_mul(read_mat(m), g_uiU));
+    ui_clip(d, true);
 }
 
 // Draws the rewrite can't touch (no vertex shader, or one without camera matrices): log each kind once.
@@ -935,6 +1052,137 @@ static void note_plain(IDirect3DDevice9* d, const ShaderMats* s) {
              !vs ? "none" : s ? "no camera matrix" : "not seen created", fvf, g_rtW, g_rtH, g_vp.Width, g_vp.Height);
     if (vs) vs->lpVtbl->Release(vs);
     if (g_logged.insert(key).second) { n++; log_printf("%s\n", key); }
+}
+
+// ---- TDUVR_DRAWLOG (test): every draw of two frames, with what the mod did with it ----
+// TDUVR_DRAWLOG=<s>[,<s>...]: at each time (seconds from start, or "+<s>" from when head look found the
+// in-car camera), logs every draw of the next two frames (one per eye): the mod's classification, shaders,
+// target, textures, where the vertices land on the game's own screen (clip x/w, y/w through the shader's
+// combined matrix as the game set it), and the render states that can hide a draw. Reads vertex buffers
+// back, so test use only.
+struct DrawArgs { const char* call; D3DPRIMITIVETYPE pt; UINT prims; INT base; UINT first, verts; const void* up; UINT upStride; };
+static DrawArgs g_da;
+static int g_dlFrames;  // frames of the current log still to go
+static unsigned g_dlDraw;
+
+static UINT prim_verts(D3DPRIMITIVETYPE t, UINT n) {
+    return t == D3DPT_POINTLIST ? n : t == D3DPT_LINELIST ? 2 * n : t == D3DPT_LINESTRIP ? n + 1 : t == D3DPT_TRIANGLELIST ? 3 * n : n + 2;
+}
+
+static void drawlog_present() {
+    static char spec[128];
+    static const char* next = GetEnvironmentVariableA("TDUVR_DRAWLOG", spec, sizeof spec) ? spec : nullptr;
+    static double t0 = now_s(), tCam;
+    if (g_dlFrames && --g_dlFrames == 0) log_printf("draw log: end\n");
+    if (!next || g_dlFrames) return;
+    bool fromCar = *next == '+';
+    if (fromCar && !g_camObj) return;
+    if (fromCar && !tCam) tCam = now_s();
+    if (now_s() - (fromCar ? tCam : t0) < atof(next + fromCar)) return;
+    next = strchr(next, ',');
+    if (next) next++;
+    g_dlFrames = 2;
+    g_dlDraw = 0;
+    log_printf("draw log: frames %u-%u, first eye %d\n", g_frame, g_frame + 1, g_eye);
+}
+
+static void tex_desc(IDirect3DDevice9* d, DWORD stage, char* out, size_t cap) {
+    IDirect3DBaseTexture9* t = nullptr;
+    if (FAILED(d->lpVtbl->GetTexture(d, stage, &t)) || !t) { snprintf(out, cap, "-"); return; }
+    D3DSURFACE_DESC sd{};
+    D3DRESOURCETYPE ty = t->lpVtbl->GetType(t);
+    if (ty == D3DRTYPE_TEXTURE) ((IDirect3DTexture9*)t)->lpVtbl->GetLevelDesc((IDirect3DTexture9*)t, 0, &sd);
+    snprintf(out, cap, "%p %ux%u f%d%s%s", (void*)t, sd.Width, sd.Height, (int)sd.Format, ty == D3DRTYPE_CUBETEXTURE ? " cube" : "",
+             (sd.Usage & D3DUSAGE_RENDERTARGET) ? " RT" : "");
+    t->lpVtbl->Release(t);
+}
+
+// Range of clip x/w, y/w, z/w of the draw's vertices through M (row vector), or of the raw positions without M.
+static bool draw_extent(IDirect3DDevice9* d, const Mat4* M, float r[6], bool* pretransformed) {
+    IDirect3DVertexDeclaration9* decl = nullptr;
+    if (FAILED(d->lpVtbl->GetVertexDeclaration(d, &decl)) || !decl) return false;
+    D3DVERTEXELEMENT9 el[MAXD3DDECLLENGTH + 1];
+    UINT ne = 0;
+    HRESULT hr = decl->lpVtbl->GetDeclaration(decl, el, &ne);
+    decl->lpVtbl->Release(decl);
+    if (FAILED(hr)) return false;
+    const D3DVERTEXELEMENT9* pos = nullptr;
+    for (UINT i = 0; i < ne && el[i].Stream != 0xFF; i++)
+        if ((el[i].Usage == D3DDECLUSAGE_POSITION || el[i].Usage == D3DDECLUSAGE_POSITIONT) && el[i].UsageIndex == 0) { pos = &el[i]; break; }
+    int comps = !pos ? 0 : pos->Type == D3DDECLTYPE_FLOAT2 ? 2 : pos->Type == D3DDECLTYPE_FLOAT3 ? 3 : pos->Type == D3DDECLTYPE_FLOAT4 ? 4 : 0;
+    if (!comps) return false;
+    *pretransformed = pos->Usage == D3DDECLUSAGE_POSITIONT;
+    const BYTE* data = (const BYTE*)g_da.up;
+    UINT stride = g_da.upStride;
+    __int64 first = g_da.first, size = 1ll << 40;
+    IDirect3DVertexBuffer9* vb = nullptr;
+    void* p = nullptr;
+    if (!data) {
+        UINT off = 0;
+        if (FAILED(d->lpVtbl->GetStreamSource(d, pos->Stream, &vb, &off, &stride)) || !vb) return false;
+        D3DVERTEXBUFFER_DESC vd{};
+        vb->lpVtbl->GetDesc(vb, &vd);
+        if (FAILED(vb->lpVtbl->Lock(vb, 0, 0, &p, D3DLOCK_READONLY)) || !p) { vb->lpVtbl->Release(vb); return false; }
+        data = (const BYTE*)p + off;
+        size = (__int64)vd.Size - off;
+        first += g_da.base;
+    }
+    r[0] = r[2] = r[4] = 1e30f;
+    r[1] = r[3] = r[5] = -1e30f;
+    bool any = false;
+    for (UINT i = 0; i < g_da.verts && i < 4096; i++) {
+        __int64 o = (first + i) * stride + pos->Offset;
+        if (o < 0 || o + comps * 4 > size) break;
+        float v[4] = { 0, 0, 0, 1 };
+        memcpy(v, data + o, comps * 4);
+        if (comps < 4) v[3] = 1;
+        float x = v[0], y = v[1], z = v[2];
+        if (M && !*pretransformed) {
+            float c[4];
+            for (int j = 0; j < 4; j++) c[j] = v[0] * M->m[0][j] + v[1] * M->m[1][j] + v[2] * M->m[2][j] + v[3] * M->m[3][j];
+            if (c[3] <= 1e-6f) continue;  // behind the camera
+            x = c[0] / c[3];
+            y = c[1] / c[3];
+            z = c[2] / c[3];
+        }
+        r[0] = x < r[0] ? x : r[0]; r[1] = x > r[1] ? x : r[1];
+        r[2] = y < r[2] ? y : r[2]; r[3] = y > r[3] ? y : r[3];
+        r[4] = z < r[4] ? z : r[4]; r[5] = z > r[5] ? z : r[5];
+        any = true;
+    }
+    if (vb) { vb->lpVtbl->Unlock(vb); vb->lpVtbl->Release(vb); }
+    return any;
+}
+
+static void drawlog_draw(IDirect3DDevice9* d, const ShaderMats* s, const unsigned* before) {
+    const char* cls = "-";
+    for (int i = 0; i < R_N; i++) if (g_st[i] != before[i]) cls = kRName[i];
+    char where[160] = "where ?";
+    Mat4 M;
+    bool haveM = s && s->anyK >= 0, pre = false;
+    if (haveM) M = read_mat(s->mats[s->anyK]);
+    float r[6];
+    if (draw_extent(d, haveM ? &M : nullptr, r, &pre))
+        snprintf(where, sizeof where, "%s x %.3f..%.3f y %.3f..%.3f z %.4g..%.4g", pre ? "pixels" : haveM ? "clip" : "raw", r[0], r[1], r[2], r[3], r[4], r[5]);
+    static const D3DRENDERSTATETYPE kRs[11] = { D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ZFUNC, D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND,
+                                                D3DRS_ALPHATESTENABLE, D3DRS_COLORWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_SCISSORTESTENABLE, D3DRS_CLIPPLANEENABLE };
+    DWORD rs[11] = {};
+    for (int i = 0; i < 11; i++) d->lpVtbl->GetRenderState(d, kRs[i], &rs[i]);
+    RECT sc{};
+    if (rs[9]) d->lpVtbl->GetScissorRect(d, &sc);
+    IDirect3DVertexShader9* vs = nullptr;
+    IDirect3DPixelShader9* ps = nullptr;
+    d->lpVtbl->GetVertexShader(d, &vs);
+    d->lpVtbl->GetPixelShader(d, &ps);
+    if (vs) vs->lpVtbl->Release(vs);
+    if (ps) ps->lpVtbl->Release(ps);
+    char t0[96], t1[96];
+    tex_desc(d, 0, t0, sizeof t0);
+    tex_desc(d, 1, t1, sizeof t1);
+    log_printf("draw %u eye %d %s pt%d x%u | %s | vs %p (%d mats) ps %p | rt %ux%u vp %lu,%lu %lux%lu | t0 %s | t1 %s | %s | z %lu/%lu f%lu blend %lu %lu/%lu at %lu cw %lx st %lu sc %lu [%ld %ld %ld %ld] clip %lx\n",
+               g_dlDraw++, g_eye, g_da.call, (int)g_da.pt, g_da.prims, cls, (void*)vs, s ? (int)s->mats.size() : -1, (void*)ps, g_rtW, g_rtH,
+               g_vp.X, g_vp.Y, g_vp.Width, g_vp.Height, t0, t1, where, rs[0], rs[1], rs[2], rs[3], rs[4], rs[5], rs[6], rs[7], rs[8], rs[9],
+               sc.left, sc.top, sc.right, sc.bottom, rs[10]);
 }
 
 static void apply_body(IDirect3DDevice9* d) {
@@ -1004,9 +1252,15 @@ static void apply(IDirect3DDevice9* d) {
         if (n++ < 5) log_printf("state block: draw while recording, recording assumed dropped (frame %u)\n", g_frame);
     }
     double t0 = now_s();
+    unsigned before[R_N];
+    if (g_dlFrames) memcpy(before, g_st, sizeof before);
+    const ShaderMats* s = g_cur;
+    unsigned ui = g_st[R_UI];
     apply_body(d);
+    if (g_uiClip && g_st[R_UI] == ui) ui_clip(d, false);  // the clip planes are for 2D on the virtual screen only
     if (g_batch) flush_consts(d);
     g_applyMs += (now_s() - t0) * 1000;
+    if (g_dlFrames) drawlog_draw(d, s, before);
 }
 
 // ---- back buffer -> headset ----
@@ -1338,6 +1592,9 @@ static void on_present(IDirect3DDevice9* d) {
         g_camOk = false;
         g_camEarly = false;
         g_n3d = 0;
+        drawlog_present();
+        static bool cullOff = GetEnvironmentVariableA("TDUVR_NOCULLFIX", nullptr, 0) > 0;  // test: the game's own cull
+        if (!g_cullOrig && g_knownExe && !cullOff) cull_hook();  // retried each frame until SecuROM has decrypted the code
     } else {
         g_frame++;
     }
@@ -1427,8 +1684,6 @@ static HRESULT STDMETHODCALLTYPE hReset(IDirect3DDevice9* d, D3DPRESENT_PARAMETE
     release_copies();
     gpu_release();
     vk_release();
-    g_rtTex.clear();  // render targets must be released before Reset; the game recreates them after
-    g_tex0 = nullptr;
     force_pp(pp);
     HRESULT hr = H(d).Reset(d, pp);
     log_printf("Reset hr=0x%08lx %ux%u fmt %d windowed %d\n", hr, pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0,
@@ -1437,6 +1692,8 @@ static HRESULT STDMETHODCALLTYPE hReset(IDirect3DDevice9* d, D3DPRESENT_PARAMETE
     g_mod.clear();
     consts_unknown();
     g_recording = false;
+    g_uiClip = false;  // Reset turned the clip planes off
+    g_uiClipGen = 0;
     if (SUCCEEDED(hr)) {
         hook_device(d);  // in case the runtime rebuilt the table
         read_bb_size(d);
@@ -1589,33 +1846,23 @@ static HRESULT STDMETHODCALLTYPE hSetViewport(IDirect3DDevice9* d, const D3DVIEW
     return H(d).SetViewport(d, vp);
 }
 
-static HRESULT STDMETHODCALLTYPE hCreateTexture(IDirect3DDevice9* d, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT fmt,
-                                                D3DPOOL pool, IDirect3DTexture9** out, HANDLE* shared) {
-    HRESULT hr = H(d).CreateTexture(d, w, h, levels, usage, fmt, pool, out, shared);
-    if (SUCCEEDED(hr) && out && *out && (usage & D3DUSAGE_RENDERTARGET) && !other_dev(d)) g_rtTex.insert(*out);
-    return hr;
-}
-
-static HRESULT STDMETHODCALLTYPE hSetTexture(IDirect3DDevice9* d, DWORD stage, IDirect3DBaseTexture9* t) {
-    if (stage == 0 && !other_dev(d)) g_tex0 = t;
-    return H(d).SetTexture(d, stage, t);
-}
-
-
-
 static HRESULT STDMETHODCALLTYPE hDrawPrimitive(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b) {
+    if (g_dlFrames) g_da = DrawArgs{ "DP", t, b, 0, a, prim_verts(t, b), nullptr, 0 };
     if (!other_dev(d)) apply(d);
     return H(d).DrawPrimitive(d, t, a, b);
 }
 static HRESULT STDMETHODCALLTYPE hDrawIndexedPrimitive(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f) {
+    if (g_dlFrames) g_da = DrawArgs{ "DIP", t, f, a, b, c, nullptr, 0 };
     if (!other_dev(d)) apply(d);
     return H(d).DrawIndexedPrimitive(d, t, a, b, c, e, f);
 }
 static HRESULT STDMETHODCALLTYPE hDrawPrimitiveUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, const void* b, UINT c) {
+    if (g_dlFrames) g_da = DrawArgs{ "DPUP", t, a, 0, 0, prim_verts(t, a), b, c };
     if (!other_dev(d)) apply(d);
     return H(d).DrawPrimitiveUP(d, t, a, b, c);
 }
 static HRESULT STDMETHODCALLTYPE hDrawIndexedPrimitiveUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b, UINT c, const void* e, D3DFORMAT f, const void* g, UINT h) {
+    if (g_dlFrames) g_da = DrawArgs{ "DIPUP", t, c, 0, a, b, g, h };
     if (!other_dev(d)) apply(d);
     return H(d).DrawIndexedPrimitiveUP(d, t, a, b, c, e, f, g, h);
 }
@@ -1648,8 +1895,6 @@ static void hook_device(IDirect3DDevice9* d) {
     hook(&vt->SetVertexShaderConstantF, hSetVSConstF, &o.SetVertexShaderConstantF);
     hook(&vt->SetRenderTarget, hSetRenderTarget, &o.SetRenderTarget);
     hook(&vt->SetViewport, hSetViewport, &o.SetViewport);
-    hook(&vt->CreateTexture, hCreateTexture, &o.CreateTexture);
-    hook(&vt->SetTexture, hSetTexture, &o.SetTexture);
     hook(&vt->DrawPrimitive, hDrawPrimitive, &o.DrawPrimitive);
     hook(&vt->DrawIndexedPrimitive, hDrawIndexedPrimitive, &o.DrawIndexedPrimitive);
     hook(&vt->DrawPrimitiveUP, hDrawPrimitiveUP, &o.DrawPrimitiveUP);
@@ -1764,6 +2009,8 @@ static HRESULT STDMETHODCALLTYPE hCreateDevice(IDirect3D9* This, UINT ad, D3DDEV
     consts_unknown();
     g_recording = false;
     g_cur = nullptr;
+    g_uiClip = false;
+    g_uiClipGen = 0;
     HRESULT hr = real(This, ad, t, w, f, pp, out);
     log_printf("CreateDevice hr=0x%08lx type %d flags 0x%lx %ux%u windowed %d\n", hr, t, f,
                pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0, pp ? pp->Windowed : -1);
