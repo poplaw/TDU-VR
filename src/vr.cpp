@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d12.h>
 #include <cstdarg>
 #include <cstdio>
 #include <mutex>
@@ -18,6 +19,7 @@
 #include "vr.h"
 
 static vr::IVRSystem* g_sys;
+static bool g_fake;                 // TDUVR_NOHMD: no SteamVR, a simulated 90 Hz headset (for testing at the desk)
 static ID3D11Device* g_dev;
 static ID3D11DeviceContext* g_ctx;  // presenter thread only, after init
 static Mat4 g_originInv = m4_identity();
@@ -40,6 +42,17 @@ struct GpuImg { ID3D11Texture2D* tex = nullptr; int w = 0, h = 0; unsigned pair 
 static GpuImg g_img[2][3];
 static int g_shown[2] = { -1, -1 };
 
+// GPU path (D3D9On12): the game thread copies each frame straight into one of these on the GPU; the
+// presenter shows a pair once fence g_f12 says both copies are done (so the compositor never waits on
+// the game's rendering). Slots the presenter shows are never written.
+struct Img12 { ID3D12Resource* tex = nullptr; int w = 0, h = 0, fmt = 0; unsigned pair = 0; FramePose pose{}; UINT64 fv = 0; bool valid = false; };
+static Img12 g_i12[2][4];
+static ID3D12Device* g_d12;
+static ID3D12CommandQueue* g_q12;
+static ID3D12Fence* g_f12;
+static ID3D12Fence* g_idle12;  // to wait until the queue is idle before freeing a texture
+static UINT64 g_idleV;
+
 // Stats for the log (written by the presenter under g_mx).
 static unsigned g_stFrames, g_stUploads, g_stPairs;
 static double g_stUploadMs;
@@ -61,9 +74,17 @@ static std::string game_dir() {
 
 // SecuROM's launcher process starts the real game as a child (/Sonydadc ...): the launcher
 // starts a fresh log, the child appends, every line tagged with the process id.
+// The launcher process (no /Sonydadc) starts a session's log; the game process it starts appends. The
+// previous session's log is kept as tdu_vr.prev.log, so a failed run survives one relaunch.
+static FILE* open_log() {
+    std::string p = game_dir() + "tdu_vr.log";
+    bool launcher = !strstr(GetCommandLineA(), "/Sonydadc");
+    if (launcher) MoveFileExA(p.c_str(), (game_dir() + "tdu_vr.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
+    return _fsopen(p.c_str(), launcher ? "w" : "a", _SH_DENYNO);
+}
+
 void log_printf(const char* fmt, ...) {
-    static FILE* f = _fsopen((game_dir() + "tdu_vr.log").c_str(),
-                             strstr(GetCommandLineA(), "/Sonydadc") ? "a" : "w", _SH_DENYNO);
+    static FILE* f = open_log();
     if (!f) return;
     char buf[1024];
     va_list a;
@@ -75,7 +96,9 @@ void log_printf(const char* fmt, ...) {
 }
 
 float vr_ini_float(const char* key, float def) {
-    char buf[32], d[32];
+    char buf[32], d[32], env[64];
+    snprintf(env, sizeof env, "TDUVR_INI_%s", key);  // test override, e.g. TDUVR_INI_AutoDrive=0
+    if (GetEnvironmentVariableA(env, buf, sizeof buf) > 0) return (float)atof(buf);
     snprintf(d, sizeof d, "%g", def);
     GetPrivateProfileStringA("VR", key, d, buf, sizeof buf, (game_dir() + "tdu_vr.ini").c_str());
     return (float)atof(buf);
@@ -88,17 +111,48 @@ static Mat4 from34(const vr::HmdMatrix34_t& p) {
     return r;
 }
 
+// TDUVR_NOHMD: stands in for WaitGetPoses, returning on a steady 90 Hz grid.
+static void fake_vsync() {
+    static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    static double next = now_s();
+    next += 1.0 / g_freq;
+    double wait = next - now_s();
+    if (wait < -0.1) next = now_s();  // fell far behind (debugger, load): restart the grid
+    if (wait > 0 && timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)(wait * 1e7);
+        SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+        WaitForSingleObject(timer, 100);
+    }
+}
+
 static DWORD WINAPI presenter(void*) {
     vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
     double lastTiming = 0;
     for (;;) {
-        if (vr::VRCompositor()->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0) != vr::VRCompositorError_None) {
+        if (g_fake) fake_vsync();
+        else if (vr::VRCompositor()->WaitGetPoses(poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0) != vr::VRCompositorError_None) {
             Sleep(5);  // no focus (dashboard / other app): don't spin
             continue;
         }
         double t0 = now_s();
         unsigned uploads = 0, pairs = 0;
-        for (int e = 0; e < 2; e++) {
+        if (g_d12) {
+            // GPU path: newest pair whose two copies have finished.
+            std::lock_guard<std::mutex> lk(g_mx);
+            UINT64 done = g_f12->GetCompletedValue();
+            int bl = -1, br = -1;
+            for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) {
+                const Img12 &L = g_i12[0][i], &R = g_i12[1][j];
+                if (L.valid && R.valid && L.fv <= done && R.fv <= done && L.pair == R.pair && (bl < 0 || (int)(L.pair - g_i12[0][bl].pair) > 0)) { bl = i; br = j; }
+            }
+            if (bl >= 0 && (g_shown[0] < 0 || (int)(g_i12[0][bl].pair - g_i12[0][g_shown[0]].pair) > 0)) {
+                g_shown[0] = bl;
+                g_shown[1] = br;
+                pairs++;
+            }
+        }
+        for (int e = 0; e < 2 && !g_d12; e++) {
             EyeChain& c = g_chain[e];
             bool fresh;
             {
@@ -107,6 +161,12 @@ static DWORD WINAPI presenter(void*) {
                 if (fresh) { std::swap(c.read, c.latest); c.fresh = false; }
             }
             if (!fresh) continue;
+            // CPU path only: the D3D11 device it uploads into, made on first use (the GPU path never
+            // needs it, and in this 2 GB process every device costs address space).
+            if (!g_dev && FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &g_dev, nullptr, &g_ctx))) {
+                static bool once = (log_printf("D3D11CreateDevice failed\n"), true);
+                continue;
+            }
             const EyeBuf& b = c.buf[c.read];
             // Upload into the oldest image slot that is not on screen.
             int s = -1;
@@ -135,7 +195,7 @@ static DWORD WINAPI presenter(void*) {
         }
         // Show the newest pair that both eyes have (both images share one head pose).
         int bl = -1, br = -1;
-        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) {
+        for (int i = 0; i < 3 && !g_d12; i++) for (int j = 0; j < 3; j++) {
             const GpuImg &L = g_img[0][i], &R = g_img[1][j];
             if (L.valid && R.valid && L.pair == R.pair && (bl < 0 || (int)(L.pair - g_img[0][bl].pair) > 0)) { bl = i; br = j; }
         }
@@ -146,20 +206,32 @@ static DWORD WINAPI presenter(void*) {
         }
         double t1 = now_s();
 
-        if (g_shown[0] >= 0 && g_shown[1] >= 0) {
+        if (g_shown[0] >= 0 && g_shown[1] >= 0 && !g_fake) {
             for (int e = 0; e < 2; e++) {
-                const GpuImg& g = g_img[e][g_shown[e]];
                 vr::VRTextureWithPose_t tex{};
-                tex.handle = g.tex;
-                tex.eType = vr::TextureType_DirectX;
+                vr::D3D12TextureData_t d12{};
+                const FramePose* pose;
+                if (g_d12) {
+                    const Img12& g = g_i12[e][g_shown[e]];  // slots on screen are not rewritten: no lock needed
+                    d12.m_pResource = g.tex;
+                    d12.m_pCommandQueue = g_q12;            // the compositor reads it on our queue, after our copy
+                    tex.handle = &d12;
+                    tex.eType = vr::TextureType_DirectX12;
+                    pose = &g.pose;
+                } else {
+                    const GpuImg& g = g_img[e][g_shown[e]];
+                    tex.handle = g.tex;
+                    tex.eType = vr::TextureType_DirectX;
+                    pose = &g.pose;
+                }
                 tex.eColorSpace = vr::ColorSpace_Gamma;
-                memcpy(tex.mDeviceToAbsoluteTracking.m, g.pose.m, sizeof g.pose.m);  // reproject from the render pose
+                memcpy(tex.mDeviceToAbsoluteTracking.m, pose->m, sizeof pose->m);  // reproject from the render pose
                 vr::VRTextureBounds_t bounds{ 0, 0, 1, 1 };
                 vr::EVRCompositorError err = vr::VRCompositor()->Submit((vr::EVREye)e, &tex, &bounds, vr::Submit_TextureWithPose);
                 static int errors;
                 if (err != vr::VRCompositorError_None && errors++ < 10) log_printf("Submit eye %d error %d\n", e, err);
             }
-            g_ctx->Flush();
+            if (g_ctx) g_ctx->Flush();
         }
 
         std::lock_guard<std::mutex> lk(g_mx);
@@ -167,7 +239,7 @@ static DWORD WINAPI presenter(void*) {
         g_stUploads += uploads;
         g_stPairs += pairs;
         g_stUploadMs += (t1 - t0) * 1000;
-        if (t1 - lastTiming > 1.0) {
+        if (t1 - lastTiming > 1.0 && !g_fake) {
             lastTiming = t1;
             g_stTiming = {};
             g_stTiming.m_nSize = sizeof g_stTiming;
@@ -176,33 +248,116 @@ static DWORD WINAPI presenter(void*) {
     }
 }
 
+bool vr_no_hmd() { return GetEnvironmentVariableA("TDUVR_NOHMD", nullptr, 0) > 0; }
+bool vr_hmd_present() { return vr_no_hmd() || vr::VR_IsHmdPresent(); }
+
+void vr_gpu_init(void* device12, void* queue12, void* fence12) {
+    g_q12 = (ID3D12CommandQueue*)queue12;
+    g_f12 = (ID3D12Fence*)fence12;
+    ((ID3D12Device*)device12)->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_idle12));
+    MemoryBarrier();
+    g_d12 = (ID3D12Device*)device12;  // last: the running presenter switches to the GPU path on seeing it
+}
+
+int vr_gpu_begin(int eye, int w, int h, int fmt, void** tex12) {
+    int s = -1;
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        for (int i = 0; i < 4; i++) {  // the oldest slot not on screen
+            if (i == g_shown[eye]) continue;
+            const Img12 &a = g_i12[eye][i], &b = g_i12[eye][s < 0 ? i : s];
+            if (s < 0 || !a.valid || (b.valid && (int)(a.pair - b.pair) < 0)) s = i;
+        }
+        g_i12[eye][s].valid = false;  // being written: not shown until vr_gpu_end
+    }
+    Img12& g = g_i12[eye][s];
+    if (!g.tex || g.w != w || g.h != h || g.fmt != fmt) {
+        if (g.tex) {  // the compositor may still read it on the GPU: wait for the queue to drain first
+            HANDLE ev = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+            g_q12->Signal(g_idle12, ++g_idleV);
+            g_idle12->SetEventOnCompletion(g_idleV, ev);
+            WaitForSingleObject(ev, 1000);
+            CloseHandle(ev);
+            g.tex->Release();
+            g.tex = nullptr;
+        }
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = (UINT64)w;
+        rd.Height = (UINT)h;
+        rd.DepthOrArraySize = rd.MipLevels = 1;
+        rd.Format = (DXGI_FORMAT)fmt;
+        rd.SampleDesc.Count = 1;
+        if (FAILED(g_d12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&g.tex)))) {
+            static int fails;
+            if (fails++ < 3) log_printf("GPU copy: could not create a %dx%d eye texture (format %d)\n", w, h, fmt);
+            g.tex = nullptr;
+        }
+        g.w = w; g.h = h; g.fmt = fmt;
+    }
+    *tex12 = g.tex;
+    return s;
+}
+
+void vr_gpu_end(int eye, int slot, unsigned pair, const FramePose& pose, unsigned long long fenceValue) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    Img12& g = g_i12[eye][slot];
+    g.pair = pair;
+    g.pose = pose;
+    g.fv = fenceValue;
+    g.valid = g.tex != nullptr;
+    g_stUploads++;
+}
+
+void* vr_gpu_newest(int eye) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    int b = -1;
+    for (int i = 0; i < 4; i++)
+        if (g_i12[eye][i].valid && (b < 0 || (int)(g_i12[eye][i].pair - g_i12[eye][b].pair) > 0)) b = i;
+    return b >= 0 ? g_i12[eye][b].tex : nullptr;
+}
+
 bool vr_init() {
     g_scale = vr_ini_float("WorldScale", 1.0f);
     if (!(g_scale > 0.01f && g_scale < 100.0f)) g_scale = 1.0f;
     log_printf("TDU VR: WorldScale %.3f\n", g_scale);
 
-    if (!vr::VR_IsHmdPresent()) { log_printf("no headset found, passthrough\n"); return false; }
-    vr::EVRInitError e = vr::VRInitError_None;
-    g_sys = vr::VR_Init(&e, vr::VRApplication_Scene);
-    if (!g_sys) { log_printf("VR_Init failed: %s\n", vr::VR_GetVRInitErrorAsEnglishDescription(e)); return false; }
-    if (!vr::VRCompositor()) { log_printf("no SteamVR compositor\n"); vr::VR_Shutdown(); return false; }
-    vr::VRCompositor()->SetTrackingSpace(vr::TrackingUniverseSeated);
-
-    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &g_dev, nullptr, &g_ctx))) {
-        log_printf("D3D11CreateDevice failed\n");
-        vr::VR_Shutdown();
-        return false;
+    g_fake = vr_no_hmd();
+    uint32_t w = 2688, h = 2880;
+    if (g_fake) {
+        // A Quest 3 as SteamVR reports it (tangents and eye offsets from a real log), at 90 Hz.
+        static const float raw[2][4] = { { -1.376f, 0.839f, -1.428f, 0.966f }, { -0.839f, 1.376f, -1.428f, 0.966f } };
+        for (int eye = 0; eye < 2; eye++) {
+            memcpy(g_raw[eye], raw[eye], sizeof raw[eye]);
+            g_eyeToHead[eye] = m4_identity();
+            g_eyeToHead[eye].m[0][3] = eye ? 0.0312f : -0.0312f;
+        }
+        g_freq = 90;
+        log_printf("TDUVR_NOHMD: no SteamVR, simulated 90 Hz headset\n");
+    } else {
+        if (!vr::VR_IsHmdPresent()) { log_printf("no headset found, passthrough\n"); return false; }
+        vr::EVRInitError e = vr::VRInitError_None;
+        g_sys = vr::VR_Init(&e, vr::VRApplication_Scene);
+        if (!g_sys) { log_printf("VR_Init failed: %s\n", vr::VR_GetVRInitErrorAsEnglishDescription(e)); return false; }
+        if (!vr::VRCompositor()) { log_printf("no SteamVR compositor\n"); vr::VR_Shutdown(); return false; }
+        vr::VRCompositor()->SetTrackingSpace(vr::TrackingUniverseSeated);
     }
-    float f = g_sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float);
-    if (f > 30) g_freq = f;
-    g_v2p = g_sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_SecondsFromVsyncToPhotons_Float);
 
-    uint32_t w, h;
-    g_sys->GetRecommendedRenderTargetSize(&w, &h);
+    if (g_sys) {
+        float f = g_sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float);
+        if (f > 30) g_freq = f;
+        g_v2p = g_sys->GetFloatTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_SecondsFromVsyncToPhotons_Float);
+        g_sys->GetRecommendedRenderTargetSize(&w, &h);
+        for (int eye = 0; eye < 2; eye++) {
+            g_eyeToHead[eye] = from34(g_sys->GetEyeToHeadTransform((vr::EVREye)eye));
+            float* t = g_raw[eye];
+            g_sys->GetProjectionRaw((vr::EVREye)eye, &t[0], &t[1], &t[2], &t[3]);
+        }
+    }
     for (int eye = 0; eye < 2; eye++) {
-        g_eyeToHead[eye] = from34(g_sys->GetEyeToHeadTransform((vr::EVREye)eye));
-        float* t = g_raw[eye];
-        g_sys->GetProjectionRaw((vr::EVREye)eye, &t[0], &t[1], &t[2], &t[3]);
+        const float* t = g_raw[eye];
         log_printf("eye %d tangents l %.3f r %.3f t %.3f b %.3f, offset x %.4f m\n", eye, t[0], t[1], t[2], t[3], g_eyeToHead[eye].m[0][3]);
     }
     log_printf("SteamVR ready: %.0f Hz, recommended per-eye %ux%u (aspect %.2f)\n", g_freq, w, h, (double)w / h);
@@ -234,13 +389,17 @@ void vr_begin_frame(int eye, bool newPair, float maxYaw, float maxPitch, float t
 
     static vr::HmdMatrix34_t pairPose = g_lastPose;
     if (newPair) {
-        // Predict for when this pair reaches the eyes: both eyes rendered + one frame readback lag
-        // + presenter pickup + photons. The compositor corrects the rest from the tagged pose.
-        float predict = (float)(3 * g_frameDt) + 0.5f / g_freq + g_v2p;
+        // Predict for when this pair reaches the eyes: both eyes rendered (+ one frame readback lag on
+        // the CPU path) + presenter pickup + photons. The compositor corrects the rest from the tagged pose.
+        float predict = (float)((g_d12 ? 2 : 3) * g_frameDt) + 0.5f / g_freq + g_v2p;
         vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
-        g_sys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseSeated, predict < 0.1f ? predict : 0.1f, poses, vr::k_unMaxTrackedDeviceCount);
-        const auto& hp = poses[vr::k_unTrackedDeviceIndex_Hmd];
-        if (hp.bPoseIsValid) g_lastPose = hp.mDeviceToAbsoluteTracking;
+        bool valid = true;  // TDUVR_NOHMD: the head stays where it is (or moves with TDUVR_FAKEHEAD)
+        if (g_sys) {
+            g_sys->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseSeated, predict < 0.1f ? predict : 0.1f, poses, vr::k_unMaxTrackedDeviceCount);
+            const auto& hp = poses[vr::k_unTrackedDeviceIndex_Hmd];
+            valid = hp.bPoseIsValid;
+            if (valid) g_lastPose = hp.mDeviceToAbsoluteTracking;
+        }
         // TDUVR_FAKEHEAD=<degrees>,<seconds>: test without wearing the headset; the head looks straight
         // ahead and turns left/right by that many degrees, once per that many seconds.
         static char fake[32];
@@ -253,7 +412,7 @@ void vr_begin_frame(int eye, bool newPair, float maxYaw, float maxPitch, float t
         }
         pairPose = g_lastPose;
 
-        if (g_needRecenter && hp.bPoseIsValid) {
+        if (g_needRecenter && valid) {
             // New origin: current head position, yaw only (keep the horizon level).
             g_needRecenter = false;
             Mat4 head = from34(pairPose);
@@ -302,7 +461,7 @@ const char* vr_status() {
     unsigned nf = g_stFrames - lastFrames, nu = g_stUploads - lastUploads, np = g_stPairs - lastPairs;
     const auto& ft = g_stTiming;
     static const char* kActivity[] = { "idle", "in use", "in use (paused)", "STANDBY", "idle" };
-    int act = g_sys->GetTrackedDeviceActivityLevel(vr::k_unTrackedDeviceIndex_Hmd);
+    int act = g_sys ? g_sys->GetTrackedDeviceActivityLevel(vr::k_unTrackedDeviceIndex_Hmd) : 1;
     snprintf(buf, sizeof buf,
              "presenter %.0f Hz, new eye images %.0f/s (upload %.2f ms each), new pairs shown %.0f/s | SteamVR: headset %s, throttled %u, "
              "motion smoothing %s, dropped %u, app gpu %.1f ms (total %.1f), compositor gpu %.1f ms, submit %.2f ms",
