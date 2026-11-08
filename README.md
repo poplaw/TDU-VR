@@ -69,7 +69,7 @@ To uninstall, delete those three files.
 ## Settings that matter
 Each eye gets every other game frame, so each eye's picture updates at **half the game's FPS**. Head rotation is still reprojected at the full headset rate, but everything that moves in the scene (and at speed, that's everything) only updates at half the game's FPS. That's why it can feel well below 90 even though Virtual Desktop shows 90. The status lines in `tdu_vr.log` show both: `fps` (the game) and `new pairs shown` (what each eye gets).
 - `GpuCopy=1` (the default) is the biggest win: see above.
-- `DXVK=1` (experimental, needs `dxvk_d3d9.dll`): about twice the frame rate of D3D9On12 in tests, so each eye can update at the headset's full rate. Not yet verified in a headset; if the headset shows nothing, set it back to 0.
+- `DXVK=1` (experimental, needs `dxvk_d3d9.dll`): about twice the frame rate of D3D9On12 in tests, so each eye can update at the headset's full rate. Played in a Quest 3 through Virtual Desktop; if the headset shows nothing, set it back to 0.
 - If another frame limiter or overlay hooks the game (for example framepacer), exclude `TestDriveUnlimited.exe` from it. It sits in the same Present call.
 
 **Frame generation must be off.** Both SteamVR's **Motion Smoothing** and Virtual Desktop's **SSW** force the app to half rate and invent the in-between frames from motion. With alternate-eye images that warps, stretches and wobbles the world.
@@ -101,6 +101,5 @@ With `AutoDrive=1`, a launch reaches the in-car view on its own. Keep the game w
 - **HUD and menu sharpness.** The virtual screen is drawn at the game's resolution and then squeezed into part of the eye image, so small text can be soft. Raising `UiFov` makes it bigger. Screen-space effects drawn as 2D with plain textures, such as lens flares, would land on the virtual screen too.
 - **Alternate-eye artifacts.** At high speed, side scenery can shimmer, because each eye's image comes from a different frame.
 - **Half-rate eyes.** Alternate-eye rendering gives each eye half the game's FPS. Real 90 Hz per eye needs either 180 game fps or both eyes drawn in one frame (each main-view draw issued twice, into two render targets). That's the next big step.
-- **DXVK path not verified with the headset on yet.** It runs with SteamVR and an idle headset (SteamVR then shows 10 frames per second), including the hand-over to SteamVR.
 - **D3D9On12 is the ceiling.** Its worker thread can't keep up during the draw-heavy part of each frame, and taking frames out costs about 2 ms per pair. Batching cut the game thread's waiting, but about 112 fps parked (roughly 56 pairs per second) is near what 9On12 allows for this game. Plain d3d9 runs it at ~150 fps but can't hand frames to SteamVR on the GPU: it can't create shareable surfaces, so neither D3D11 sharing nor OpenGL interop (`WGL_NV_DX_interop`) can read them (tested).
 - **Lighting.** Per-pixel lighting, specular and mirrors use the original camera, so small errors appear when you lean far.
