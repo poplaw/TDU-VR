@@ -12,6 +12,7 @@
 #include <vector>
 #include "ctab.h"
 #include "gpu.h"
+#include "vk.h"
 #include "vr.h"
 
 static const int MAXC = 256;
@@ -330,6 +331,10 @@ static bool g_recording;                        // the game is recording a state
 static unsigned g_stSbCreate, g_stSbApply, g_stSbCapture;  // state block use (status line)
 static unsigned g_stConstCalls, g_stConstRegs;  // device calls / registers sent (status line)
 static double g_copyWaitMs, g_submitMs, g_applyMs, g_readbackMs;  // cumulative ms, for the status line
+static IDirect3DDevice9* volatile g_watchDev;  // the game's device (the one the mod works on)
+// Another device sharing the hooked table: DXVK gives all its devices one vtable (Windows' d3d9 a copy
+// each), so the tiny second device the game opens in the house comes through the hooks too.
+static bool other_dev(IDirect3DDevice9* d) { return g_watchDev && d != g_watchDev; }
 static double g_presentMs, g_presentMax;                           // time inside the real Present
 
 static double now_s() {
@@ -989,6 +994,7 @@ static void apply_body(IDirect3DDevice9* d) {
 }
 
 static bool g_gpuDue;  // a frame was captured for the GPU copy: finish it after Present
+static bool use_dxvk();
 
 // Called before every draw.
 static void apply(IDirect3DDevice9* d) {
@@ -1095,6 +1101,14 @@ static void finish_slot(Slot& s) {
 // can hold the game thread until the GPU has caught up.
 
 static void submit_backbuffer(IDirect3DDevice9* d) {
+    static bool noCopy = GetEnvironmentVariableA("TDUVR_NOCOPY", nullptr, 0) > 0;  // test: measure the renderer alone
+    if (noCopy) return;
+    if (use_dxvk()) {  // DXVK: Vulkan images straight to SteamVR (falls through if the interop is missing)
+        double t = now_s();
+        bool done = vk_capture(d, g_eye, g_frame >> 1, g_framePose);
+        g_readbackMs += (now_s() - t) * 1000;
+        if (done) return;
+    }
     if (gpu_on()) {
         double t = now_s();
         g_gpuDue = gpu_capture(d, g_eye, g_frame >> 1, g_framePose);
@@ -1152,7 +1166,6 @@ static void submit_backbuffer(IDirect3DDevice9* d) {
 
 // ---- device hooks ----
 static bool g_inPresent;  // device Present may call swap chain Present internally: submit once
-static IDirect3DDevice9* volatile g_watchDev;  // the game's device (the one the mod works on)
 
 // TDUVR_LOOKTEST: cycle fixed head-look angles (2 s each) and log the camera the game produced,
 // to check sign, limits and smoothing of the game's head-look.
@@ -1363,6 +1376,7 @@ static void finish_gpu_frame() {
 static bool skip_desktop() { return g_vr && gpu_on(); }
 
 static HRESULT STDMETHODCALLTYPE hPresent(IDirect3DDevice9* d, const RECT* a, const RECT* b, HWND w, const RGNDATA* r) {
+    if (other_dev(d)) return H(d).Present(d, a, b, w, r);
     count(C_PRESENT);
     on_present(d);
     g_inPresent = true;
@@ -1408,8 +1422,10 @@ static void force_pp(D3DPRESENT_PARAMETERS* pp) {
 static void hook_device(IDirect3DDevice9* d);
 
 static HRESULT STDMETHODCALLTYPE hReset(IDirect3DDevice9* d, D3DPRESENT_PARAMETERS* pp) {
+    if (other_dev(d)) return H(d).Reset(d, pp);
     release_copies();
     gpu_release();
+    vk_release();
     g_rtTex.clear();  // render targets must be released before Reset; the game recreates them after
     g_tex0 = nullptr;
     force_pp(pp);
@@ -1447,6 +1463,7 @@ static HRESULT STDMETHODCALLTYPE hCreateVertexShader(IDirect3DDevice9* d, const 
 }
 
 static HRESULT STDMETHODCALLTYPE hSetVertexShader(IDirect3DDevice9* d, IDirect3DVertexShader9* s) {
+    if (other_dev(d)) return H(d).SetVertexShader(d, s);
     count(C_SVS);
     auto it = s ? g_shaders.find(s) : g_shaders.end();
     g_cur = it == g_shaders.end() ? nullptr : &it->second;
@@ -1455,7 +1472,7 @@ static HRESULT STDMETHODCALLTYPE hSetVertexShader(IDirect3DDevice9* d, IDirect3D
 
 static HRESULT STDMETHODCALLTYPE hSetVSConstF(IDirect3DDevice9* d, UINT start, const float* data, UINT count) {
     ::count(C_SVSC);
-    if (g_recording) return H(d).SetVertexShaderConstantF(d, start, data, count);  // goes into the state block
+    if (g_recording || other_dev(d)) return H(d).SetVertexShaderConstantF(d, start, data, count);  // into the state block / not ours
     for (UINT i = 0; i < count && start + i < MAXC; i++) {
         memcpy(g_vsc[start + i], data + i * 4, 16);
         g_isMod[start + i] = false;  // hardware now holds the game's value again
@@ -1478,12 +1495,12 @@ static HRESULT STDMETHODCALLTYPE hSetVSConstF(IDirect3DDevice9* d, UINT start, c
 
 // Calls that read or capture the vertex shader constants: the device must hold what the game set first.
 static HRESULT STDMETHODCALLTYPE hGetVSConstF(IDirect3DDevice9* d, UINT start, float* data, UINT count) {
-    if (g_batch) flush_consts(d);
+    if (g_batch && !other_dev(d)) flush_consts(d);
     return H(d).GetVertexShaderConstantF(d, start, data, count);
 }
 static HRESULT STDMETHODCALLTYPE hProcessVertices(IDirect3DDevice9* d, UINT a, UINT b, UINT c, IDirect3DVertexBuffer9* vb,
                                                   IDirect3DVertexDeclaration9* decl, DWORD f) {
-    if (g_batch) flush_consts(d);
+    if (g_batch && !other_dev(d)) flush_consts(d);
     return H(d).ProcessVertices(d, a, b, c, vb, decl, f);
 }
 // State blocks (TDU records some). Their Capture and Apply read and write device state behind the
@@ -1526,12 +1543,14 @@ static void hook_state_block(IDirect3DStateBlock9* sb) {
     }
 }
 static HRESULT STDMETHODCALLTYPE hCreateStateBlock(IDirect3DDevice9* d, D3DSTATEBLOCKTYPE t, IDirect3DStateBlock9** out) {
+    if (other_dev(d)) return H(d).CreateStateBlock(d, t, out);
     if (g_batch) flush_consts(d);  // it captures the current state
     HRESULT hr = H(d).CreateStateBlock(d, t, out);
     if (SUCCEEDED(hr) && out) hook_state_block(*out);
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE hBeginStateBlock(IDirect3DDevice9* d) {
+    if (other_dev(d)) return H(d).BeginStateBlock(d);
     if (g_batch) flush_consts(d);
     HRESULT hr = H(d).BeginStateBlock(d);
     if (SUCCEEDED(hr)) g_recording = true;
@@ -1540,6 +1559,7 @@ static HRESULT STDMETHODCALLTYPE hBeginStateBlock(IDirect3DDevice9* d) {
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE hEndStateBlock(IDirect3DDevice9* d, IDirect3DStateBlock9** out) {
+    if (other_dev(d)) return H(d).EndStateBlock(d, out);
     HRESULT hr = H(d).EndStateBlock(d, out);
     g_recording = false;
     if (SUCCEEDED(hr) && out) hook_state_block(*out);
@@ -1549,6 +1569,7 @@ static HRESULT STDMETHODCALLTYPE hEndStateBlock(IDirect3DDevice9* d, IDirect3DSt
 }
 
 static HRESULT STDMETHODCALLTYPE hSetRenderTarget(IDirect3DDevice9* d, DWORD idx, IDirect3DSurface9* s) {
+    if (other_dev(d)) return H(d).SetRenderTarget(d, idx, s);
     count(C_SRT);
     if (idx == 0 && s) {
         D3DSURFACE_DESC dd;
@@ -1563,35 +1584,39 @@ static HRESULT STDMETHODCALLTYPE hSetRenderTarget(IDirect3DDevice9* d, DWORD idx
 }
 
 static HRESULT STDMETHODCALLTYPE hSetViewport(IDirect3DDevice9* d, const D3DVIEWPORT9* vp) {
-    if (vp) g_vp = *vp;
+    if (vp && !other_dev(d)) g_vp = *vp;
     return H(d).SetViewport(d, vp);
 }
 
 static HRESULT STDMETHODCALLTYPE hCreateTexture(IDirect3DDevice9* d, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT fmt,
                                                 D3DPOOL pool, IDirect3DTexture9** out, HANDLE* shared) {
     HRESULT hr = H(d).CreateTexture(d, w, h, levels, usage, fmt, pool, out, shared);
-    if (SUCCEEDED(hr) && out && *out && (usage & D3DUSAGE_RENDERTARGET)) g_rtTex.insert(*out);
+    if (SUCCEEDED(hr) && out && *out && (usage & D3DUSAGE_RENDERTARGET) && !other_dev(d)) g_rtTex.insert(*out);
     return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE hSetTexture(IDirect3DDevice9* d, DWORD stage, IDirect3DBaseTexture9* t) {
-    if (stage == 0) g_tex0 = t;
+    if (stage == 0 && !other_dev(d)) g_tex0 = t;
     return H(d).SetTexture(d, stage, t);
 }
 
 
 
 static HRESULT STDMETHODCALLTYPE hDrawPrimitive(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b) {
-    apply(d); return H(d).DrawPrimitive(d, t, a, b);
+    if (!other_dev(d)) apply(d);
+    return H(d).DrawPrimitive(d, t, a, b);
 }
 static HRESULT STDMETHODCALLTYPE hDrawIndexedPrimitive(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT a, UINT b, UINT c, UINT e, UINT f) {
-    apply(d); return H(d).DrawIndexedPrimitive(d, t, a, b, c, e, f);
+    if (!other_dev(d)) apply(d);
+    return H(d).DrawIndexedPrimitive(d, t, a, b, c, e, f);
 }
 static HRESULT STDMETHODCALLTYPE hDrawPrimitiveUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, const void* b, UINT c) {
-    apply(d); return H(d).DrawPrimitiveUP(d, t, a, b, c);
+    if (!other_dev(d)) apply(d);
+    return H(d).DrawPrimitiveUP(d, t, a, b, c);
 }
 static HRESULT STDMETHODCALLTYPE hDrawIndexedPrimitiveUP(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b, UINT c, const void* e, D3DFORMAT f, const void* g, UINT h) {
-    apply(d); return H(d).DrawIndexedPrimitiveUP(d, t, a, b, c, e, f, g, h);
+    if (!other_dev(d)) apply(d);
+    return H(d).DrawIndexedPrimitiveUP(d, t, a, b, c, e, f, g, h);
 }
 
 static void hook_device(IDirect3DDevice9* d) {
@@ -1732,6 +1757,7 @@ static HRESULT STDMETHODCALLTYPE hCreateDevice(IDirect3D9* This, UINT ad, D3DDEV
     else if (pp && pp->hDeviceWindow) g_gameWnd = pp->hDeviceWindow;
     release_copies();  // they belong to the previous device
     gpu_release();
+    vk_release();
     for (int r : g_mod) g_isMod[r] = false;
     g_mod.clear();
     consts_unknown();
@@ -1791,15 +1817,69 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
 }
 
 // ---- exports ----
+// DXVK=1 (tdu_vr.ini) or TDUVR_DXVK=1: the game's D3D9 runs on DXVK (Vulkan) instead of Windows' d3d9:
+// dxvk_d3d9.dll next to this dll, which is DXVK's 32-bit d3d9.dll renamed. Only with a headset: without
+// one the mod stays out of the way.
+static bool g_onDxvk;  // DXVK is loaded and is the game's D3D9
+static bool use_dxvk() { return g_onDxvk; }
+
 static HMODULE real_d3d9() {
     static HMODULE h;
     if (!h) {
+        init_once();  // whether VR is on (and DXVK wanted) decides which d3d9 to load
         char p[MAX_PATH];
+        if (g_vr && (GetEnvironmentVariableA("TDUVR_DXVK", nullptr, 0) > 0 || vr_ini_float("DXVK", 0) != 0)) {
+            GetModuleFileNameA((HMODULE)&__ImageBase, p, MAX_PATH);
+            char* slash = strrchr(p, '\\');
+            if (slash) strcpy_s(slash + 1, MAX_PATH - (slash + 1 - p), "dxvk_d3d9.dll");
+            h = LoadLibraryA(p);
+            g_onDxvk = h && GetProcAddress(h, "Direct3DCreate9");
+            log_printf("DXVK: %s %s\n", p, g_onDxvk ? "loaded" : "could not be loaded, using Windows' d3d9");
+            if (g_onDxvk) return h;
+        }
         GetSystemDirectoryA(p, MAX_PATH);  // SysWOW64 for this 32-bit process
         strcat_s(p, "\\d3d9.dll");
         h = LoadLibraryA(p);
     }
     return h;
+}
+
+// DXVK reports the GPU a little differently from Windows' d3d9 (a made-up driver version, no subsystem
+// id or revision, modes in another order), and TDU resets its video settings when the GPU it sees
+// changes: one run on DXVK set the saved resolution back to the default. So on DXVK the game gets
+// Windows' answers for its adapter's identity and display modes.
+static IDirect3D9* windows_d3d9() {
+    static IDirect3D9* w = [] {
+        char p[MAX_PATH];
+        GetSystemDirectoryA(p, MAX_PATH);
+        strcat_s(p, "\\d3d9.dll");
+        HMODULE m = LoadLibraryA(p);
+        auto fn = m ? (IDirect3D9*(WINAPI*)(UINT))GetProcAddress(m, "Direct3DCreate9") : nullptr;
+        return fn ? fn(D3D_SDK_VERSION) : nullptr;
+    }();
+    return w;
+}
+static HRESULT STDMETHODCALLTYPE hGetAdapterIdentifier(IDirect3D9* This, UINT a, DWORD f, D3DADAPTER_IDENTIFIER9* id) {
+    IDirect3D9* w = windows_d3d9();
+    return w ? w->lpVtbl->GetAdapterIdentifier(w, a, f, id) : D3DERR_NOTAVAILABLE;
+}
+static UINT STDMETHODCALLTYPE hGetAdapterModeCount(IDirect3D9* This, UINT a, D3DFORMAT fmt) {
+    IDirect3D9* w = windows_d3d9();
+    return w ? w->lpVtbl->GetAdapterModeCount(w, a, fmt) : 0;
+}
+static HRESULT STDMETHODCALLTYPE hEnumAdapterModes(IDirect3D9* This, UINT a, D3DFORMAT fmt, UINT i, D3DDISPLAYMODE* m) {
+    IDirect3D9* w = windows_d3d9();
+    return w ? w->lpVtbl->EnumAdapterModes(w, a, fmt, i, m) : D3DERR_NOTAVAILABLE;
+}
+static void mirror_windows_adapter(IDirect3D9* d3d) {
+    if (!windows_d3d9() || d3d->lpVtbl->GetAdapterIdentifier == hGetAdapterIdentifier) return;
+    decltype(IDirect3D9Vtbl::GetAdapterIdentifier) a;
+    decltype(IDirect3D9Vtbl::GetAdapterModeCount) b;
+    decltype(IDirect3D9Vtbl::EnumAdapterModes) c;
+    hook(&d3d->lpVtbl->GetAdapterIdentifier, hGetAdapterIdentifier, &a);
+    hook(&d3d->lpVtbl->GetAdapterModeCount, hGetAdapterModeCount, &b);
+    hook(&d3d->lpVtbl->EnumAdapterModes, hEnumAdapterModes, &c);
+    log_printf("DXVK: adapter identity and modes come from Windows' d3d9\n");
 }
 
 extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT sdk) {
@@ -1810,7 +1890,7 @@ extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT sdk) {
     init_once();
     static int gpuWanted = -1;
     if (gpuWanted < 0) {
-        gpuWanted = g_vr && vr_ini_float("GpuCopy", 1) != 0;
+        gpuWanted = g_vr && vr_ini_float("GpuCopy", 1) != 0 && !g_onDxvk;
         log_printf("GPU copy (D3D9On12): %s\n", gpuWanted ? "on" : "off");
     }
     IDirect3D9* d3d = gpuWanted ? (IDirect3D9*)gpu_create_d3d9(real_d3d9(), sdk) : nullptr;
@@ -1826,6 +1906,7 @@ extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT sdk) {
         hook(&d3d->lpVtbl->CreateDevice, hCreateDevice, &g_d3dOrig[slot].CreateDevice);
         if (fresh) g_nD3D++;
     }
+    if (d3d && g_onDxvk) mirror_windows_adapter(d3d);
     return d3d;
 }
 
