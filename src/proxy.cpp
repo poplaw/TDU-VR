@@ -256,33 +256,64 @@ static bool headlook_verify() {
     }
 }
 
-// ---- the game's sphere cull (0x50b3b0) ----
-// A camera method (thiscall: center, radius -> 0 outside, 1 inside, 2 crossing): the center goes through
-// the camera's view (+0x30), then |x| and |y| (both scaled by 1/aspect at +0xbc) are tested against
-// tan/cos/sin of half the vertical FOV (+0x20/+0x18/+0x1c): about 44 deg around where the camera looks.
-// The game culls cars with it (spheres of 2.2-2.8 m, from 0x8bb52d and 0x96ac2c), and buildings and
-// terrain sectors. The headset shows up to 55 deg (Quest 3), and past the head-look limits the camera
-// stops following the head: cars beside you vanished, so you drove into them. For the main view, an
-// object now also counts as visible when it is inside a cone around this frame's eye (the camera's
-// view times invEye) as wide as the eye's frustum plus a margin. Other cameras (reflection cube faces,
-// shadows) keep the game's test.
-typedef int(__fastcall* CullFn)(const char* cam, void* edx, const float* center, float radius);
-static CullFn g_cullOrig;                                     // trampoline: the overwritten instructions, then a jump back
-static const char* const kMainCam = (const char*)0x13a67e0;  // the game's copy of the camera it draws the main view with
-static unsigned g_cullN, g_cullBack;                         // main-view tests / objects only the eye's cone kept (status line)
+// ---- culling for the headset's view (2007 exe) ----
+// Jumps from game code at f (16-aligned) to fn; returns the trampoline (the first len bytes of f, whole
+// position-independent instructions, then a jump back), or null if f doesn't start with head: another exe,
+// or SecuROM (which encrypts this code in the file) hasn't decrypted it yet.
+static void* hook_code(unsigned char* f, const unsigned char* head, size_t headLen, size_t len, void* fn) {
+    __try {
+        if (memcmp(f, head, headLen)) return nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+    unsigned char* t = (unsigned char*)VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!t) return nullptr;
+    memcpy(t, f, len);
+    t[len] = 0xE9;
+    *(LONG*)(t + len + 1) = (LONG)((f + len) - (t + len + 5));
+    unsigned char patch[8];
+    memcpy(patch, f, 8);
+    patch[0] = 0xE9;
+    *(LONG*)(patch + 1) = (LONG)((unsigned char*)fn - (f + 5));
+    for (size_t i = 5; i < 8 && i < len; i++) patch[i] = 0x90;
+    DWORD old;
+    VirtualProtect(f, 8, PAGE_EXECUTE_READWRITE, &old);
+    InterlockedExchange64((volatile LONG64*)f, *(LONG64*)patch);  // one aligned write: no thread sees half of it
+    VirtualProtect(f, 8, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), f, 8);
+    return t;
+}
 
-// The game keeps the main camera in several copies (world and render-relative coordinates): same rotation and FOV.
+static const DWORD kInCarCamVt = 0xf14638;  // the in-car camera's class
+
+// The game's sphere cull (0x50b3b0), a camera method (thiscall: center, radius -> 0 outside, 1 inside,
+// 2 crossing): the center goes through the camera's view (+0x30), then |x| and |y| (both scaled by
+// 1/aspect at +0xbc) are tested against tan/cos/sin of half the vertical FOV (+0x20/+0x18/+0x1c): about
+// 44 deg around where the camera looks. The game culls cars with it (spheres of 2.2-2.8 m, from 0x8bb52d
+// and 0x96ac2c), and buildings and terrain sectors. The headset shows up to 55 deg (Quest 3), and past
+// the head-look limits the camera stops following the head: cars beside you vanished, so you drove into
+// them. For the main view, what the game culls also gets tested against a cone around this frame's eye
+// (the camera's view times invEye) as wide as the eye's frustum plus a margin; what the game keeps is
+// left alone. Other cameras (reflection cube faces, shadows) keep the game's test.
+typedef int(__fastcall* CullFn)(const char* cam, void* edx, const float* center, float radius);
+static CullFn g_cullOrig;
+static const char* const kMainCam = (const char*)0x13a67e0;  // the game's copy of the camera it draws the main view with
+static unsigned g_cullN, g_cullBack;                         // main-view objects the game culled / of those, kept (status line)
+
+// The in-car camera, or one of the copies the game keeps of the main camera (world and render-relative
+// coordinates): same rotation. (The in-car camera itself can be a frame ahead of the copies while turning.)
 static bool main_view(const char* cam) {
+    if (*(const DWORD*)cam == kInCarCamVt) return true;
     const float* a = (const float*)(cam + 0x30);
     const float* b = (const float*)(kMainCam + 0x30);
     for (int i = 0; i < 12; i++)
         if ((i & 3) != 3 && std::fabs(a[i] - b[i]) > 1e-3f) return false;
-    return std::fabs(*(const float*)(cam + 0x10) - *(const float*)(kMainCam + 0x10)) < 1e-3f;
+    return true;
 }
 
 static int __fastcall hCull(const char* cam, void* edx, const float* c, float r) {
     int game = g_cullOrig(cam, edx, c, r);
-    if (game == 1 || !main_view(cam)) return game;
+    if (game || !main_view(cam)) return game;
     static const float tanW = [] {  // widest eye tangent + 5 deg for head motion until the frame is shown
         float t = -g_ev.l > g_ev.r ? -g_ev.l : g_ev.r, v = g_ev.up > g_ev.down ? g_ev.up : g_ev.down;
         return tanf(atanf(t > v ? t : v) + 5 * 3.14159265f / 180);
@@ -300,37 +331,61 @@ static int __fastcall hCull(const char* cam, void* edx, const float* c, float r)
     *(float*)(eye + 0xbc) = 1;  // the same angle on both axes
     int res = g_cullOrig(eye, edx, c, r);
     g_cullN++;
-    if (!game && res) g_cullBack++;
-    return res ? res : game;
+    if (res) g_cullBack++;
+    return res;
 }
 
-// True once hooked. The code is SecuROM-encrypted in the file, so it is checked in memory first.
-static bool cull_hook() {
-    static const unsigned char head[] = { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x83, 0xEC, 0x1C };  // push ebp; mov ebp,esp; and esp,-16; sub esp,0x1c
-    unsigned char* f = (unsigned char*)0x50b3b0;
-    __try {
-        if (memcmp(f, head, sizeof head)) return false;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
+// The in-car camera's FOV (Camera::SetFov 0x404840: +0x10 the FOV, +0x18/+0x1c/+0x20 cos/sin/tan of half of
+// it). The game uses the two differently (parked at the house, splitting the fields): the FOV itself builds
+// the projection and a frustum it culls part of the world with (2922 draws at 57 deg, 3624 with only +0x10 at
+// 110: vegetation and props), cos/sin/tan set level of detail and draw distance (2390 with only those at 110:
+// distant trees and signs gone). In the car the FOV is 57 deg tall, 65 at speed; the headset shows 99 deg
+// tall (Quest 3), so things at the edges of your view were culled and popped in as you looked around. The
+// mod's rewrite replaces the projection anyway, so +0x10 is set as wide as this frame's eye sees, wherever
+// it looks (rolled, or past the head-look limits), plus 5 deg: 120 deg on a Quest 3 looking straight ahead.
+// Level of detail keeps the car's FOV at rest: the detail you'd get on a monitor, no longer less at speed
+// (the widening there is a flat-screen speed effect you don't see in the headset).
+typedef void(__fastcall* SetFovFn)(char* cam, void* edx, float fov);
+static SetFovFn g_setFovOrig;
+static float g_cullFov, g_lodFov;  // last set, radians (status line)
+
+static void __fastcall hSetFov(char* cam, void* edx, float fov) {
+    if (*(const DWORD*)cam != kInCarCamVt) { g_setFovOrig(cam, edx, fov); return; }
+    static const char* car;
+    static float atRest;
+    if (cam != car || fov < atRest) { car = cam; atRest = fov; }  // the smallest FOV seen: no speed effect
+    g_setFovOrig(cam, edx, atRest);
+    // The corners of the eye's frustum (either eye: x as wide as the wider side) in camera space: p_cam =
+    // p_eye * transpose(R), R the rotation in invEye (camera -> eye). The culling frustum must reach them.
+    const Mat4& M = g_ev.invEye;
+    float x = -g_ev.l > g_ev.r ? -g_ev.l : g_ev.r, aspect = *(const float*)(cam + 0x14), needV = 0, needH = 0;
+    bool behind = !(aspect > 0.1f);
+    for (int k = 0; k < 4; k++) {
+        float e[3] = { k & 1 ? x : -x, k & 2 ? g_ev.up : -g_ev.down, -1 }, c[3];
+        for (int i = 0; i < 3; i++) c[i] = e[0] * M.m[i][0] + e[1] * M.m[i][1] + e[2] * M.m[i][2];
+        if (!(c[2] < -1e-3f)) { behind = true; break; }  // a corner at or past 90 deg from the camera's axis
+        float v = atanf(std::fabs(c[1] / c[2])), h = atanf(std::fabs(c[0] / c[2]));
+        needV = v > needV ? v : needV;
+        needH = h > needH ? h : needH;
     }
-    unsigned char* t = (unsigned char*)VirtualAlloc(nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!t) return false;
-    memcpy(t, f, 6);  // push ebp; mov ebp,esp; and esp,-16
-    t[6] = 0xE9;
-    *(LONG*)(t + 7) = (LONG)((f + 6) - (t + 11));
-    g_cullOrig = (CullFn)t;
-    unsigned char patch[8];
-    memcpy(patch, f, 8);
-    patch[0] = 0xE9;
-    *(LONG*)(patch + 1) = (LONG)((unsigned char*)hCull - (f + 5));
-    patch[5] = 0x90;
-    DWORD old;
-    VirtualProtect(f, 8, PAGE_EXECUTE_READWRITE, &old);
-    InterlockedExchange64((volatile LONG64*)f, *(LONG64*)patch);  // one aligned write: no thread sees half of it
-    VirtualProtect(f, 8, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), f, 8);
-    log_printf("cull: main view tested against the eye's frustum\n");
-    return true;
+    float hv = behind ? 0 : atanf(tanf(needH) / aspect);  // vertical half-angle that gives that much horizontally
+    float half = (needV > hv ? needV : hv) + 5 * 3.14159265f / 180;  // + head motion until the frame is shown
+    if (behind || !(half < 1.396f)) half = 1.396f;  // 80 deg at most: the projection needs under 90 (and not NaN)
+    *(float*)(cam + 0x10) = 2 * half;
+    g_cullFov = 2 * half;
+    g_lodFov = atRest;
+}
+
+static void cull_hooks() {
+    static const unsigned char cullHead[] = { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x83, 0xEC, 0x1C };  // push ebp; mov ebp,esp; and esp,-16; sub esp,0x1c
+    static const unsigned char fovHead[] = { 0xD9, 0x44, 0x24, 0x04, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x04 };  // fld [esp+4]; movss xmm0,[esp+4]
+    if (!g_cullOrig) g_cullOrig = (CullFn)hook_code((unsigned char*)0x50b3b0, cullHead, sizeof cullHead, 6, (void*)hCull);
+    if (!g_setFovOrig) g_setFovOrig = (SetFovFn)hook_code((unsigned char*)0x404840, fovHead, sizeof fovHead, 10, (void*)hSetFov);
+    static bool logged;
+    if (g_cullOrig && g_setFovOrig && !logged) {
+        logged = true;
+        log_printf("culling: the main view's covers the eye's frustum (sphere cull 0x50b3b0, in-car FOV 0x404840)\n");
+    }
 }
 
 static Slot g_slot[2];
@@ -496,8 +551,9 @@ static void log_status() {
         g_earlyBad[0] = g_earlyBad[1] = 0;
     }
     if (g_cullOrig && frames) {
-        log_printf("  cull: %.1f main-view tests per frame the game's cone didn't pass whole, %.1f of them kept by the eye's cone\n",
-                   g_cullN / (double)frames, g_cullBack / (double)frames);
+        log_printf("  culling: in-car FOV for culling %.0f deg, level of detail %.0f deg | sphere cull: %.1f main-view objects per frame outside"
+                   " the game's cone, %.1f of them kept by the eye's\n",
+                   g_cullFov * 57.2958f, g_lodFov * 57.2958f, g_cullN / (double)frames, g_cullBack / (double)frames);
         g_cullN = g_cullBack = 0;
     }
     last = t; lastFrame = g_frame; lastDraw = g_cnt[C_DRAW]; lastWait = g_copyWaitMs; lastSubmit = g_submitMs; lastApply = g_applyMs;
@@ -1593,8 +1649,8 @@ static void on_present(IDirect3DDevice9* d) {
         g_camEarly = false;
         g_n3d = 0;
         drawlog_present();
-        static bool cullOff = GetEnvironmentVariableA("TDUVR_NOCULLFIX", nullptr, 0) > 0;  // test: the game's own cull
-        if (!g_cullOrig && g_knownExe && !cullOff) cull_hook();  // retried each frame until SecuROM has decrypted the code
+        static bool cullOff = GetEnvironmentVariableA("TDUVR_NOCULLFIX", nullptr, 0) > 0;  // test: the game's own culling
+        if ((!g_cullOrig || !g_setFovOrig) && g_knownExe && !cullOff) cull_hooks();  // retried until SecuROM has decrypted the code
     } else {
         g_frame++;
     }
