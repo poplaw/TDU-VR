@@ -285,6 +285,11 @@ struct DevOrig {
     decltype(IDirect3DDevice9Vtbl::DrawIndexedPrimitive) DrawIndexedPrimitive;
     decltype(IDirect3DDevice9Vtbl::DrawPrimitiveUP) DrawPrimitiveUP;
     decltype(IDirect3DDevice9Vtbl::DrawIndexedPrimitiveUP) DrawIndexedPrimitiveUP;
+    decltype(IDirect3DDevice9Vtbl::GetVertexShaderConstantF) GetVertexShaderConstantF;
+    decltype(IDirect3DDevice9Vtbl::ProcessVertices) ProcessVertices;
+    decltype(IDirect3DDevice9Vtbl::CreateStateBlock) CreateStateBlock;
+    decltype(IDirect3DDevice9Vtbl::BeginStateBlock) BeginStateBlock;
+    decltype(IDirect3DDevice9Vtbl::EndStateBlock) EndStateBlock;
 };
 static const int MAXORIG = 32;
 static DevOrig g_orig[MAXORIG];
@@ -320,6 +325,10 @@ static const char* kRName[R_N] = { "rewritten(exact)", "rewritten(recovered)", "
                                    "skip:2D-other", "skip:offscreen-shape", "skip:sub-viewport", "skip:not-projection",
                                    "skip:no-camera-yet", "untouched(no camera matrix)" };
 static unsigned g_st[R_N];
+static bool g_batch;                            // constant batching (TDUVR_CONSTBATCH), see flush_consts
+static bool g_recording;                        // the game is recording a state block (see hBeginStateBlock)
+static unsigned g_stSbCreate, g_stSbApply, g_stSbCapture;  // state block use (status line)
+static unsigned g_stConstCalls, g_stConstRegs;  // device calls / registers sent (status line)
 static double g_copyWaitMs, g_submitMs, g_applyMs, g_readbackMs;  // cumulative ms, for the status line
 static double g_presentMs, g_presentMax;                           // time inside the real Present
 
@@ -369,8 +378,31 @@ static void log_status() {
         g_frameMs.clear();
         memset(g_stepHist, 0, sizeof g_stepHist);
     }
-    if (g_vr) log_printf("  %s\n", vr_status());
+    if (g_vr) {
+        // Address space in use (reserved or committed) and the largest free block: the 2 GB limit of this
+        // 32-bit game is what the old CPU copy ran into at 2560x1440.
+        MEMORY_BASIC_INFORMATION mbi;
+        size_t used = 0, maxFree = 0;
+        for (const char* a = nullptr; VirtualQuery(a, &mbi, sizeof mbi); a = (const char*)mbi.BaseAddress + mbi.RegionSize) {
+            if (mbi.State == MEM_FREE && mbi.RegionSize > maxFree) maxFree = mbi.RegionSize;
+            else used += mbi.RegionSize;
+            if ((UINT_PTR)a + mbi.RegionSize < (UINT_PTR)a) break;
+        }
+        log_printf("  %s | address space used %u MB, largest free block %u MB\n", vr_status(), (unsigned)(used >> 20), (unsigned)(maxFree >> 20));
+    }
     if (g_vr && gpu_on()) log_printf("  %s\n", gpu_status());
+    {
+        static unsigned lastCalls, lastRegs, lastGame;
+        static unsigned lastSb[3];
+        if (g_batch)
+            log_printf("  constants: game sets %.0f times per frame, batched into %.0f device calls (%.0f registers); state blocks made %u, applied %u, captured %u\n",
+                       (g_cnt[C_SVSC] - lastGame) * perF, (g_stConstCalls - lastCalls) * perF, (g_stConstRegs - lastRegs) * perF,
+                       g_stSbCreate - lastSb[0], g_stSbApply - lastSb[1], g_stSbCapture - lastSb[2]);
+        lastSb[0] = g_stSbCreate; lastSb[1] = g_stSbApply; lastSb[2] = g_stSbCapture;
+        lastCalls = g_stConstCalls;
+        lastRegs = g_stConstRegs;
+        lastGame = g_cnt[C_SVSC];
+    }
     if (g_headLook) {
         static unsigned lastFixes;
         log_printf("  head look: yaw %+.1f pitch %+.1f deg, camera object %s, corrected %u frames | rendered with another look than read:"
@@ -405,12 +437,88 @@ static Mat4 read_mat(const MatSlot& s) {
     return M;
 }
 
+// ---- constant batching (TDUVR_CONSTBATCH) ----
+// The game's SetVertexShaderConstantF calls and the mod's matrix writes only update g_want; right before
+// each draw, the registers that really changed go to the device in as few calls as possible. Under
+// D3D9On12 every call is a command for its worker thread, and the game thread spent ~23% of each frame
+// waiting on that worker inside these calls (profiled). Off while the game records or creates state
+// blocks: those capture and restore constants behind our back.
+static float g_want[MAXC][4];        // what the device must hold at the next draw (the game's value or a rewrite)
+static float g_have[MAXC][4];        // what it holds
+static unsigned g_dirty[MAXC / 32];  // g_want may differ from g_have
+static unsigned g_haveOk[MAXC / 32]; // g_have is known
+
+static void mark(int r) { g_dirty[r >> 5] |= 1u << (r & 31); }
+static void set_want(int r, const float* v) { memcpy(g_want[r], v, 16); mark(r); }
+
+// Every register strictly between a and b has a known device value (so it can go along in a window).
+static bool known_between(int a, int b) {
+    for (int r = a + 1; r < b; r++)
+        if (!((g_haveOk[r >> 5] >> (r & 31)) & 1)) return false;
+    return true;
+}
+
+static void flush_consts(IDirect3DDevice9* d) {
+    int lo = -1, hi = -1;
+    auto send = [&] {
+        H(d).SetVertexShaderConstantF(d, lo, g_have[lo], hi - lo + 1);
+        g_stConstCalls++;
+        g_stConstRegs += hi - lo + 1;
+    };
+    for (int w = 0; w < MAXC / 32; w++) {
+        for (unsigned bits = g_dirty[w]; bits; bits &= bits - 1) {
+            unsigned long b;
+            _BitScanForward(&b, bits);
+            int r = w * 32 + (int)b;
+            bool known = (g_haveOk[w] >> b) & 1;
+            if (known && !memcmp(g_want[r], g_have[r], 16)) continue;
+            memcpy(g_have[r], g_want[r], 16);
+            g_haveOk[w] |= 1u << b;
+            // Windows of up to 16 registers: D3D9On12's command buffer (d3d9.dll lhbatchfilter) gives every
+            // call of 1-16 registers a 268-byte slot and of 17-256 a 4108-byte one, and each time the 768 KB
+            // buffer fills the game thread waits for the worker. Unchanged registers inside a window go
+            // along (g_have holds the device's value for them): they cost nothing extra.
+            if (lo >= 0 && r - lo < 16 && known_between(hi, r)) { hi = r; continue; }
+            if (lo >= 0) send();
+            lo = hi = r;
+        }
+        g_dirty[w] = 0;
+    }
+    if (lo >= 0) send();
+}
+
+static void batch_off(IDirect3DDevice9* d, const char* why) {
+    if (!g_batch) return;
+    flush_consts(d);
+    g_batch = false;
+    log_printf("constant batching: off (%s)\n", why);
+}
+
+// The device's constants are unknown (new device, Reset): send everything the game wants again.
+static void consts_unknown() {
+    memset(g_haveOk, 0, sizeof g_haveOk);
+    memset(g_dirty, 0xff, sizeof g_dirty);
+}
+
+// Batching on/off while running (A/B test). On: start from the game's values, rewrites are redone at the
+// next draws. Off: the device first gets everything pending.
+static void set_batch(IDirect3DDevice9* d, bool on) {
+    if (on == g_batch) return;
+    if (!on) { flush_consts(d); g_batch = false; return; }
+    for (int r : g_mod) g_isMod[r] = false;
+    g_mod.clear();
+    memcpy(g_want, g_vsc, sizeof g_want);
+    consts_unknown();
+    g_batch = true;
+}
+
 static void write_mat(IDirect3DDevice9* d, const MatSlot& s, const Mat4& M) {
     float buf[4][4];
     int n = s.count > 4 ? 4 : s.count;
     if (s.reg + n > MAXC) return;
     for (int j = 0; j < n; j++) for (int i = 0; i < 4; i++) buf[j][i] = M.m[i][j];
-    H(d).SetVertexShaderConstantF(d, s.reg, &buf[0][0], n);
+    if (g_batch) for (int j = 0; j < n; j++) set_want(s.reg + j, buf[j]);
+    else H(d).SetVertexShaderConstantF(d, s.reg, &buf[0][0], n);
     for (int j = 0; j < n; j++) if (!g_isMod[s.reg + j]) { g_isMod[s.reg + j] = true; g_mod.push_back(s.reg + j); }
 }
 
@@ -525,7 +633,8 @@ static void restore_stale(IDirect3DDevice9* d, const ShaderMats* keep) {
     size_t w = 0;
     for (int r : g_mod) {
         if (owns(keep, r)) { g_mod[w++] = r; continue; }
-        H(d).SetVertexShaderConstantF(d, r, g_vsc[r], 1);
+        if (g_batch) set_want(r, g_vsc[r]);
+        else H(d).SetVertexShaderConstantF(d, r, g_vsc[r], 1);
         g_isMod[r] = false;
     }
     g_mod.resize(w);
@@ -879,10 +988,18 @@ static void apply_body(IDirect3DDevice9* d) {
     rewrite(d, s, Pd.m[0][0], Pd.m[1][1], Pd.m[2][2], Pd.m[3][2], Pd.m[2][3] > 0 ? 1.0f : -1.0f, nullptr, -1);
 }
 
+static bool g_gpuDue;  // a frame was captured for the GPU copy: finish it after Present
+
 // Called before every draw.
 static void apply(IDirect3DDevice9* d) {
+    if (g_recording) {
+        g_recording = false;
+        static int n;
+        if (n++ < 5) log_printf("state block: draw while recording, recording assumed dropped (frame %u)\n", g_frame);
+    }
     double t0 = now_s();
     apply_body(d);
+    if (g_batch) flush_consts(d);
     g_applyMs += (now_s() - t0) * 1000;
 }
 
@@ -910,14 +1027,16 @@ static void read_bb_size(IDirect3DDevice9* d) {
 
 // TDUVR_DUMP=<file.bmp>[,<seconds>]: write one eye image, exactly as sent to the headset, for checking.
 // ",+<seconds>" counts from when head look found the in-car camera (the attract demo starts at random times).
+// A path with one %d (or %03d) writes an image every <seconds> instead, numbered.
 static char g_dumpPath[MAX_PATH + 16];
 static bool dump_due() {
     static bool done;
-    static double t0 = now_s(), tCam;
-    char* env = g_dumpPath;
-    if (done || GetEnvironmentVariableA("TDUVR_DUMP", env, sizeof g_dumpPath) == 0) return false;
-    char* comma = strrchr(env, ',');
-    double after = comma ? atof(comma + 1) : 60;
+    static int n;
+    static double t0 = now_s(), tCam, tLast;
+    char spec[MAX_PATH + 16];
+    if (done || GetEnvironmentVariableA("TDUVR_DUMP", spec, sizeof spec) == 0) return false;
+    char* comma = strrchr(spec, ',');
+    double after = comma ? atof(comma + 1 + (comma[1] == '+')) : 60;
     if (comma && comma[1] == '+') {
         if (!g_camObj) return false;
         if (!tCam) tCam = now_s();
@@ -926,7 +1045,17 @@ static bool dump_due() {
         return false;
     }
     if (comma) *comma = 0;
-    done = true;
+    const char* pct = strchr(spec, '%');
+    size_t digits = pct ? strspn(pct + 1, "0123456789") : 0;
+    bool repeat = pct && pct[1 + digits] == 'd' && !strchr(pct + 1, '%') && after > 0;
+    if (!repeat) {
+        strcpy_s(g_dumpPath, spec);
+        done = true;
+        return true;
+    }
+    if (tLast && now_s() - tLast < after) return false;
+    tLast = now_s();
+    snprintf(g_dumpPath, sizeof g_dumpPath, spec, n++);  // checked above: exactly one %[digits]d
     return true;
 }
 
@@ -964,12 +1093,11 @@ static void finish_slot(Slot& s) {
 // GPU path (D3D9On12, GpuCopy=1): the back buffer is copied into an eye image on the GPU. CPU path
 // (plain d3d9): GPU -> system memory -> D3D11, 15 MB per frame at 2560x1440, and GetRenderTargetData
 // can hold the game thread until the GPU has caught up.
-static struct { bool pending; int eye; unsigned pair; FramePose pose; } g_gpuFrame;  // captured, finished after Present
 
 static void submit_backbuffer(IDirect3DDevice9* d) {
     if (gpu_on()) {
         double t = now_s();
-        g_gpuFrame = { gpu_capture(d), g_eye, g_frame >> 1, g_framePose };
+        g_gpuDue = gpu_capture(d, g_eye, g_frame >> 1, g_framePose);
         g_readbackMs += (now_s() - t) * 1000;
         return;
     }
@@ -1112,6 +1240,26 @@ static void auto_drive(unsigned draws, unsigned draws3d) {
     tSince = t;
 }
 
+// TDUVR_ABTEST=<seconds>: once in the car, cycle constant batching and copy lag through all four
+// combinations, <seconds> each, to compare them in one run (the status lines name the mode).
+static void ab_test(IDirect3DDevice9* d) {
+    static double every = [] {
+        char v[16];
+        return GetEnvironmentVariableA("TDUVR_ABTEST", v, sizeof v) ? atof(v) : 0.0;
+    }();
+    static double tCar;
+    static int mode = -1;
+    if (every <= 0 || !g_camObj) return;
+    if (!tCar) tCar = now_s();
+    int m = (int)((now_s() - tCar) / every) % 4;
+    if (m == mode) return;
+    mode = m;
+    bool batch = (m & 1) != 0, pair = (m & 2) != 0;
+    gpu_set_pair_copy(pair);
+    set_batch(d, batch);
+    log_printf("A/B test: constant batching %s, pair copy %s\n", batch ? "on" : "off", pair ? "on" : "off");
+}
+
 static void on_present(IDirect3DDevice9* d) {
     {
         static double tPrev;
@@ -1126,6 +1274,7 @@ static void on_present(IDirect3DDevice9* d) {
         }
     }
     log_status();
+    if (g_vr) ab_test(d);
     if (g_vr) {
         static unsigned lastDraws, last3d;
         unsigned n3d = g_st[R_PAIR] + g_st[R_OTHER];
@@ -1161,6 +1310,7 @@ static void on_present(IDirect3DDevice9* d) {
             g_fedYaw[g_fedN & 3] = yaw;
             g_fedPitch[g_fedN & 3] = pitch;
         }
+        prof_frame(inCar);
         sim_frame(g_eye == 0, inCar);  // SimLock: the pair's steps, after its look is fed so its camera uses it
         // Assume the in-car camera applies what we just fed until it says otherwise (first draw).
         g_appliedYaw = inCar ? yaw : 0;
@@ -1199,12 +1349,12 @@ static void clear_frame(IDirect3DDevice9* d) {
 
 // GPU path: the second half of the copy, once Present has submitted the frame's work.
 static void finish_gpu_frame() {
-    if (!g_gpuFrame.pending) return;
-    g_gpuFrame.pending = false;
+    if (!g_gpuDue) return;
+    g_gpuDue = false;
     double t = now_s();
-    bool ok = gpu_finish(g_gpuFrame.eye, g_gpuFrame.pair, g_gpuFrame.pose);
+    int eye = gpu_finish();
     g_readbackMs += (now_s() - t) * 1000;
-    if (ok && dump_due()) gpu_read_eye(g_gpuFrame.eye, write_bmp);
+    if (eye >= 0 && dump_due()) gpu_read_eye(eye, write_bmp);
 }
 
 // GPU copy: the game's frames are not shown on the desktop. D3D9On12's Present to the game window
@@ -1268,6 +1418,8 @@ static HRESULT STDMETHODCALLTYPE hReset(IDirect3DDevice9* d, D3DPRESENT_PARAMETE
                pp ? pp->BackBufferFormat : 0, pp ? pp->Windowed : -1);
     for (int r : g_mod) g_isMod[r] = false;
     g_mod.clear();
+    consts_unknown();
+    g_recording = false;
     if (SUCCEEDED(hr)) {
         hook_device(d);  // in case the runtime rebuilt the table
         read_bb_size(d);
@@ -1303,6 +1455,7 @@ static HRESULT STDMETHODCALLTYPE hSetVertexShader(IDirect3DDevice9* d, IDirect3D
 
 static HRESULT STDMETHODCALLTYPE hSetVSConstF(IDirect3DDevice9* d, UINT start, const float* data, UINT count) {
     ::count(C_SVSC);
+    if (g_recording) return H(d).SetVertexShaderConstantF(d, start, data, count);  // goes into the state block
     for (UINT i = 0; i < count && start + i < MAXC; i++) {
         memcpy(g_vsc[start + i], data + i * 4, 16);
         g_isMod[start + i] = false;  // hardware now holds the game's value again
@@ -1312,7 +1465,87 @@ static HRESULT STDMETHODCALLTYPE hSetVSConstF(IDirect3DDevice9* d, UINT start, c
         for (int r : g_mod) if (g_isMod[r]) g_mod[w++] = r;
         g_mod.resize(w);
     }
+    if (g_batch && data && start + count <= MAXC) {
+        for (UINT i = 0; i < count; i++) set_want(start + i, data + i * 4);
+        return D3D_OK;
+    }
+    if (g_batch) {  // out of the shadowed range: keep the device's order, and forget what it held there
+        flush_consts(d);
+        for (UINT r = start; r < MAXC && r < start + count; r++) g_haveOk[r >> 5] &= ~(1u << (r & 31));
+    }
     return H(d).SetVertexShaderConstantF(d, start, data, count);
+}
+
+// Calls that read or capture the vertex shader constants: the device must hold what the game set first.
+static HRESULT STDMETHODCALLTYPE hGetVSConstF(IDirect3DDevice9* d, UINT start, float* data, UINT count) {
+    if (g_batch) flush_consts(d);
+    return H(d).GetVertexShaderConstantF(d, start, data, count);
+}
+static HRESULT STDMETHODCALLTYPE hProcessVertices(IDirect3DDevice9* d, UINT a, UINT b, UINT c, IDirect3DVertexBuffer9* vb,
+                                                  IDirect3DVertexDeclaration9* decl, DWORD f) {
+    if (g_batch) flush_consts(d);
+    return H(d).ProcessVertices(d, a, b, c, vb, decl, f);
+}
+// State blocks (TDU records some). Their Capture and Apply read and write device state behind the
+// batching shadows: both get the pending constants first, and after an Apply the device's constants are
+// unknown (the block may hold some) until the game sets them again, and rewrites are redone. While the
+// game records a block, its constant calls go straight to the device: they belong to the block, the
+// device's live state doesn't change.
+static decltype(IDirect3DStateBlock9Vtbl::Apply) oSbApply;
+static decltype(IDirect3DStateBlock9Vtbl::Capture) oSbCapture;
+
+static HRESULT STDMETHODCALLTYPE hSbApply(IDirect3DStateBlock9* sb) {
+    IDirect3DDevice9* d = g_watchDev;
+    if (g_batch && d) flush_consts(d);
+    HRESULT hr = oSbApply(sb);
+    g_stSbApply++;
+    memset(g_haveOk, 0, sizeof g_haveOk);
+    for (int r : g_mod) g_isMod[r] = false;
+    g_mod.clear();
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hSbCapture(IDirect3DStateBlock9* sb) {
+    IDirect3DDevice9* d = g_watchDev;
+    if (g_batch && d) flush_consts(d);
+    g_stSbCapture++;
+    return oSbCapture(sb);
+}
+static void hook_state_block(IDirect3DStateBlock9* sb) {
+    if (!sb) return;
+    g_stSbCreate++;
+    // shortcut: all state blocks assumed to share d3d9's Apply/Capture (like the swap chain Present above)
+    if (sb->lpVtbl->Apply != hSbApply) {
+        decltype(oSbApply) a;
+        hook(&sb->lpVtbl->Apply, hSbApply, &a);
+        if (!oSbApply) oSbApply = a;
+    }
+    if (sb->lpVtbl->Capture != hSbCapture) {
+        decltype(oSbCapture) c;
+        hook(&sb->lpVtbl->Capture, hSbCapture, &c);
+        if (!oSbCapture) oSbCapture = c;
+    }
+}
+static HRESULT STDMETHODCALLTYPE hCreateStateBlock(IDirect3DDevice9* d, D3DSTATEBLOCKTYPE t, IDirect3DStateBlock9** out) {
+    if (g_batch) flush_consts(d);  // it captures the current state
+    HRESULT hr = H(d).CreateStateBlock(d, t, out);
+    if (SUCCEEDED(hr) && out) hook_state_block(*out);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hBeginStateBlock(IDirect3DDevice9* d) {
+    if (g_batch) flush_consts(d);
+    HRESULT hr = H(d).BeginStateBlock(d);
+    if (SUCCEEDED(hr)) g_recording = true;
+    static int n;
+    if (n++ < 5) log_printf("state block: recording starts (device %p, frame %u, hr 0x%08lx)\n", (void*)d, g_frame, hr);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hEndStateBlock(IDirect3DDevice9* d, IDirect3DStateBlock9** out) {
+    HRESULT hr = H(d).EndStateBlock(d, out);
+    g_recording = false;
+    if (SUCCEEDED(hr) && out) hook_state_block(*out);
+    static int n;
+    if (n++ < 5) log_printf("state block: recording ends (device %p, frame %u, hr 0x%08lx)\n", (void*)d, g_frame, hr);
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE hSetRenderTarget(IDirect3DDevice9* d, DWORD idx, IDirect3DSurface9* s) {
@@ -1345,6 +1578,8 @@ static HRESULT STDMETHODCALLTYPE hSetTexture(IDirect3DDevice9* d, DWORD stage, I
     if (stage == 0) g_tex0 = t;
     return H(d).SetTexture(d, stage, t);
 }
+
+
 
 static HRESULT STDMETHODCALLTYPE hDrawPrimitive(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT a, UINT b) {
     apply(d); return H(d).DrawPrimitive(d, t, a, b);
@@ -1393,6 +1628,12 @@ static void hook_device(IDirect3DDevice9* d) {
     hook(&vt->DrawIndexedPrimitive, hDrawIndexedPrimitive, &o.DrawIndexedPrimitive);
     hook(&vt->DrawPrimitiveUP, hDrawPrimitiveUP, &o.DrawPrimitiveUP);
     hook(&vt->DrawIndexedPrimitiveUP, hDrawIndexedPrimitiveUP, &o.DrawIndexedPrimitiveUP);
+    hook(&vt->GetVertexShaderConstantF, hGetVSConstF, &o.GetVertexShaderConstantF);
+    hook(&vt->ProcessVertices, hProcessVertices, &o.ProcessVertices);
+    hook(&vt->CreateStateBlock, hCreateStateBlock, &o.CreateStateBlock);
+    hook(&vt->BeginStateBlock, hBeginStateBlock, &o.BeginStateBlock);
+    hook(&vt->EndStateBlock, hEndStateBlock, &o.EndStateBlock);
+
     if (fresh) g_nOrig++;  // publish only after the table is filled
     log_printf("hooked device vtable %p (slot %d)\n", (const void*)vt, slot);
 }
@@ -1445,6 +1686,10 @@ static void init_once() {
             g_autoStage = vr_ini_float("AutoDrive", 1) != 0 ? 1 : 0;
             log_printf("auto drive: %s\n", g_autoStage ? "on" : "off");
             sim_lock_start();
+            prof_init();
+            char cb[4] = "";
+            g_batch = !(GetEnvironmentVariableA("TDUVR_CONSTBATCH", cb, sizeof cb) > 0 && cb[0] == '0');  // on unless =0
+            log_printf("constant batching: %s\n", g_batch ? "on" : "off");
             // In the headset nobody touches mouse or keyboard (and a gamepad doesn't count as input to
             // Windows): keep the monitor from going to sleep, which loses a plain D3D9 device.
             SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
@@ -1489,6 +1734,8 @@ static HRESULT STDMETHODCALLTYPE hCreateDevice(IDirect3D9* This, UINT ad, D3DDEV
     gpu_release();
     for (int r : g_mod) g_isMod[r] = false;
     g_mod.clear();
+    consts_unknown();
+    g_recording = false;
     g_cur = nullptr;
     HRESULT hr = real(This, ad, t, w, f, pp, out);
     log_printf("CreateDevice hr=0x%08lx type %d flags 0x%lx %ux%u windowed %d\n", hr, t, f,
@@ -1531,6 +1778,11 @@ static LONG CALLBACK on_exception(EXCEPTION_POINTERS* e) {
 BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         log_printf("loaded, cmdline: %s\n", GetCommandLineA());
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        log_printf("address space: %u MB (exe %s large address aware)\n", (unsigned)(((UINT_PTR)si.lpMaximumApplicationAddress >> 20) + 1),
+                   (((IMAGE_NT_HEADERS*)((char*)GetModuleHandleA(nullptr) + ((IMAGE_DOS_HEADER*)GetModuleHandleA(nullptr))->e_lfanew))->FileHeader.Characteristics &
+                    IMAGE_FILE_LARGE_ADDRESS_AWARE) ? "is" : "is not");
         AddVectoredExceptionHandler(1, on_exception);
     } else if (reason == DLL_PROCESS_DETACH) {
         log_printf("process exiting (frame %u)\n", g_frame);

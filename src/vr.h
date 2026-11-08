@@ -37,3 +37,7 @@ int vr_gpu_begin(int eye, int w, int h, int dxgiFormat, void** tex12);
 // The copy into that slot is queued and done once fence12 reaches fenceValue: the presenter may show it.
 void vr_gpu_end(int eye, int slot, unsigned pair, const FramePose& pose, unsigned long long fenceValue);
 void* vr_gpu_newest(int eye);                                  // newest finished texture of an eye, or null
+
+// Sampling profiler (prof.cpp, TDUVR_PROFILE): off unless the variable is set.
+void prof_init();
+void prof_frame(bool inCar);

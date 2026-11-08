@@ -23,18 +23,27 @@ struct Cmd { ID3D12CommandAllocator* alloc; ID3D12GraphicsCommandList* list; UIN
 static Cmd g_cmd[4];
 static unsigned g_cmdN;
 
-static IDirect3DDevice9* g_rtDev;  // device the render target below belongs to
-static IDirect3DSurface9* g_rt;    // the back buffer is copied here, then copied on in D3D12
+static IDirect3DDevice9* g_rtDev;  // device the render targets below belong to
 static IDirect3DDevice9On12* g_on12;
 static UINT g_w, g_h;
-static bool g_captured;            // the render target holds a frame gpu_finish has not taken yet
+// The back buffer is copied into the render target of its eye, then copied on in D3D12 once the pair
+// is complete (see gpu_finish).
+struct RtSlot {
+    IDirect3DSurface9* rt;
+    unsigned uses;       // frames since the render target was made
+    bool captured;       // holds a frame gpu_finish has not taken yet
+    int eye;
+    unsigned pair;
+    FramePose pose;
+};
+static RtSlot g_slots[2];  // by eye
+static bool g_pairCopy = true;  // A/B test: false copies every frame
 // 9On12 keeps every fence handed back with a resource: ReturnUnderlyingResource got slower with each
-// frame (+0.03 ms per 1000, measured: ~10 ms per frame after an hour). So the render target is
-// replaced every kRtFrames frames; the old one is freed once our last copy from it is done.
+// frame (+0.03 ms per 1000, measured: ~10 ms per frame after an hour). So a render target is replaced
+// every kRtFrames frames; the old one is freed once our last copy from it is done.
 static const unsigned kRtFrames = 1024;
-static unsigned g_rtUses;
-static IDirect3DSurface9* g_oldRt;
-static UINT64 g_oldRtFence;
+static IDirect3DSurface9* g_oldRt[2];
+static UINT64 g_oldRtFence[2];
 
 // Time per phase of the copy, for the status line (ms summed since the last gpu_status call).
 enum { P_CAPTURE, P_UNWRAP, P_RECORD, P_RETURN, P_THROTTLE, P_N };
@@ -106,18 +115,21 @@ void* gpu_create_d3d9(void* d3d9Module, unsigned sdk) {
 }
 
 bool gpu_on() { return g_dev != nullptr; }
+void gpu_set_pair_copy(bool on) { g_pairCopy = on; }
 
 void gpu_release() {
-    if (g_rt || g_oldRt) wait_fence(g_fv);  // nothing of ours may still use them
-    if (g_rt) g_rt->Release();
-    if (g_oldRt) g_oldRt->Release();
-    g_oldRt = nullptr;
-    g_rtUses = 0;
+    bool any = false;
+    for (int e = 0; e < 2; e++) any |= g_slots[e].rt || g_oldRt[e];
+    if (any) wait_fence(g_fv);  // nothing of ours may still use them
+    for (int e = 0; e < 2; e++) {
+        if (g_slots[e].rt) g_slots[e].rt->Release();
+        g_slots[e] = RtSlot{};
+        if (g_oldRt[e]) g_oldRt[e]->Release();
+        g_oldRt[e] = nullptr;
+    }
     if (g_on12) g_on12->Release();
-    g_rt = nullptr;
     g_on12 = nullptr;
     g_rtDev = nullptr;
-    g_captured = false;
 }
 
 static D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
@@ -130,7 +142,7 @@ static D3D12_RESOURCE_BARRIER transition(ID3D12Resource* r, D3D12_RESOURCE_STATE
     return b;
 }
 
-bool gpu_capture(void* device9) {
+bool gpu_capture(void* device9, int eye, unsigned pair, const FramePose& pose) {
     double t0 = qpc_ms();
     struct Add { double t; ~Add() { g_ph[P_CAPTURE] += qpc_ms() - t; } } add{ t0 };
     IDirect3DDevice9* d = (IDirect3DDevice9*)device9;
@@ -138,11 +150,13 @@ bool gpu_capture(void* device9) {
     if (FAILED(d->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return false;
     D3DSURFACE_DESC dd;
     bb->GetDesc(&dd);
-    if (!g_rt || g_rtDev != d || g_w != dd.Width || g_h != dd.Height) {
+    if (!g_slots[0].rt || g_rtDev != d || g_w != dd.Width || g_h != dd.Height) {
         gpu_release();
         // A8R8G8B8: an X8 back buffer becomes B8G8R8A8 in D3D12, the format SteamVR takes (StretchRect sets alpha).
-        if (FAILED(d->QueryInterface(__uuidof(IDirect3DDevice9On12), (void**)&g_on12)) ||
-            FAILED(d->CreateRenderTarget(dd.Width, dd.Height, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &g_rt, nullptr))) {
+        bool ok = SUCCEEDED(d->QueryInterface(__uuidof(IDirect3DDevice9On12), (void**)&g_on12));
+        for (auto& r : g_slots)
+            ok = ok && SUCCEEDED(d->CreateRenderTarget(dd.Width, dd.Height, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &r.rt, nullptr));
+        if (!ok) {
             static int fails;
             if (fails++ < 3) log_printf("GPU copy: no 9On12 interface or render target on device %p\n", (void*)d);
             gpu_release();
@@ -154,36 +168,40 @@ bool gpu_capture(void* device9) {
         g_h = dd.Height;
         log_printf("GPU copy: %ux%u through D3D9On12\n", g_w, g_h);
     }
-    if (g_oldRt && g_fence->GetCompletedValue() >= g_oldRtFence) {
-        g_oldRt->Release();
-        g_oldRt = nullptr;
+    const int e = eye & 1;
+    if (g_oldRt[e] && g_fence->GetCompletedValue() >= g_oldRtFence[e]) {
+        g_oldRt[e]->Release();
+        g_oldRt[e] = nullptr;
     }
-    if (++g_rtUses >= kRtFrames && !g_oldRt) {
+    RtSlot& r = g_slots[e];
+    if (++r.uses >= kRtFrames && !g_oldRt[e]) {
         IDirect3DSurface9* fresh = nullptr;
         if (SUCCEEDED(d->CreateRenderTarget(dd.Width, dd.Height, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &fresh, nullptr))) {
-            g_oldRt = g_rt;
-            g_oldRtFence = g_fv;  // our last copy from it
-            g_rt = fresh;
-            g_rtUses = 0;
+            g_oldRt[e] = r.rt;
+            g_oldRtFence[e] = g_fv;  // our last copy from it
+            r.rt = fresh;
+            r.uses = 0;
         }
     }
-    HRESULT hr = d->StretchRect(bb, nullptr, g_rt, nullptr, D3DTEXF_NONE);
+    HRESULT hr = d->StretchRect(bb, nullptr, r.rt, nullptr, D3DTEXF_NONE);
     bb->Release();
-    g_captured = SUCCEEDED(hr);
-    if (!g_captured) {
+    r.captured = SUCCEEDED(hr);
+    r.eye = eye;
+    r.pair = pair;
+    r.pose = pose;
+    if (!r.captured) {
         static int fails;
         if (fails++ < 3) log_printf("GPU copy: StretchRect failed 0x%08lx\n", hr);
     }
-    return g_captured;
+    return r.captured;
 }
 
-bool gpu_finish(int eye, unsigned pair, const FramePose& pose) {
-    if (!g_captured || !g_rt) return false;
-    g_captured = false;
+// One eye's render target out of 9On12, copied into an eye image on our queue, handed back.
+static bool copy_out(RtSlot& r) {
+    r.captured = false;
     double t0 = qpc_ms();
-    g_phN++;
     ID3D12Resource* src = nullptr;
-    if (FAILED(g_on12->UnwrapUnderlyingResource(g_rt, g_q, IID_PPV_ARGS(&src)))) {
+    if (FAILED(g_on12->UnwrapUnderlyingResource(r.rt, g_q, IID_PPV_ARGS(&src)))) {
         static int fails;
         if (fails++ < 3) log_printf("GPU copy: unwrap failed\n");
         return false;
@@ -192,10 +210,10 @@ bool gpu_finish(int eye, unsigned pair, const FramePose& pose) {
     g_ph[P_UNWRAP] += t1 - t0;
     D3D12_RESOURCE_DESC sd = src->GetDesc();
     ID3D12Resource* dst = nullptr;
-    int slot = vr_gpu_begin(eye, (int)sd.Width, (int)sd.Height, (int)sd.Format, (void**)&dst);
+    int slot = vr_gpu_begin(r.eye, (int)sd.Width, (int)sd.Height, (int)sd.Format, (void**)&dst);
 
     Cmd& c = g_cmd[g_cmdN++ & 3];
-    wait_fence(c.fv);  // four frames old: done long ago
+    wait_fence(c.fv);  // two pairs old: done long ago
     c.alloc->Reset();
     c.list->Reset(c.alloc, nullptr);
     if (dst) {
@@ -215,16 +233,29 @@ bool gpu_finish(int eye, unsigned pair, const FramePose& pose) {
     g_ph[P_RECORD] += t2 - t1;
     UINT64 fv = g_fv;
     ID3D12Fence* f = g_fence;
-    g_on12->ReturnUnderlyingResource(g_rt, 1, &fv, &f);  // 9On12 waits for our copy before writing it again
+    g_on12->ReturnUnderlyingResource(r.rt, 1, &fv, &f);  // 9On12 waits for our copy before writing it again
     src->Release();
-    if (dst) vr_gpu_end(eye, slot, pair, pose, g_fv);
+    if (dst) vr_gpu_end(r.eye, slot, r.pair, r.pose, g_fv);
+    g_ph[P_RETURN] += qpc_ms() - t2;
+    return dst != nullptr;
+}
+
+int gpu_finish() {
+    // Both eyes of a pair at once, after its right eye. Taking a frame out of 9On12 makes the game thread
+    // wait until 9On12's worker has caught up (~2 ms, the copy's biggest cost); once per pair, that wait
+    // is paid half as often. The headset shows a pair only once both eyes are there, so the left eye
+    // waiting a frame in its render target delays nothing.
+    if (g_pairCopy && !g_slots[1].captured) return -1;
+    g_phN += g_pairCopy ? 2 : 1;  // phase times are reported per frame
+    int last = -1;
+    for (int e = 0; e < 2; e++)
+        if (g_slots[e].captured && copy_out(g_slots[e])) last = e;
+    // One pair in flight at most: nothing else holds the game back now that it skips the desktop
+    // Present, and pairs queued deeper only add latency.
     double t3 = qpc_ms();
-    g_ph[P_RETURN] += t3 - t2;
-    // At most two frames in flight: nothing else holds the game back now that it skips the desktop
-    // Present, and frames queued deeper only add latency.
     if (g_fv > 2) wait_fence(g_fv - 2);
     g_ph[P_THROTTLE] += qpc_ms() - t3;
-    return dst != nullptr;
+    return last;
 }
 
 void gpu_read_eye(int eye, void (*write)(const void* bits, int pitch, int w, int h)) {

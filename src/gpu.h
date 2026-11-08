@@ -8,11 +8,13 @@
 void* gpu_create_d3d9(void* d3d9Module, unsigned sdk);
 bool gpu_on();  // gpu_create_d3d9 succeeded at least once
 // Two halves around the game's Present. Before it (the back buffer still holds the frame): copy the
-// back buffer into a render target of ours. After it: take the render target's D3D12 resource out
-// (this waits until 9On12's worker thread has caught up with the game, ~1.5 ms) and copy it into an
-// eye image on the GPU.
-bool gpu_capture(void* device9);
-bool gpu_finish(int eye, unsigned pair, const FramePose& pose);
+// back buffer into the render target of its eye. After it, once the pair's right eye is in: take both
+// render targets' D3D12 resources out (this waits until 9On12's worker thread has caught up with the
+// game, ~2 ms) and copy them into eye images on the GPU. gpu_finish returns the last eye it delivered,
+// or -1 (nothing, or a left eye waiting for its right one).
+bool gpu_capture(void* device9, int eye, unsigned pair, const FramePose& pose);
+int gpu_finish();
+void gpu_set_pair_copy(bool on);  // A/B test: false = copy every frame
 // Drop what belongs to the device (before Reset, or a new device).
 void gpu_release();
 const char* gpu_status();  // time per copy phase since the last call, for the log

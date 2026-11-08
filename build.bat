@@ -14,6 +14,6 @@ rem The shader-table test also parses the game exe when it finds it (TDU_DIR, de
 if not defined TDU_DIR set "TDU_DIR=.."
 if exist "%TDU_DIR%\TestDriveUnlimited.exe" (build\test.exe "%TDU_DIR%\TestDriveUnlimited.exe" || exit /b 1) else (build\test.exe || exit /b 1)
 
-cl %FLAGS% /LD src\proxy.cpp src\vr.cpp src\gpu.cpp /Fe:build\d3d9.dll /link /DEF:src\d3d9.def third_party\openvr\lib\win32\openvr_api.lib d3d11.lib user32.lib || exit /b 1
+cl %FLAGS% /LD src\proxy.cpp src\vr.cpp src\gpu.cpp src\prof.cpp /Fe:build\d3d9.dll /link /MAP:build\d3d9.map /DEF:src\d3d9.def third_party\openvr\lib\win32\openvr_api.lib d3d11.lib user32.lib || exit /b 1
 copy /y third_party\openvr\bin\win32\openvr_api.dll build\ >nul
 echo Built build\d3d9.dll
