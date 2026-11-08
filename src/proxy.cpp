@@ -5,11 +5,13 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
 #include <vector>
 #include "ctab.h"
+#include "gpu.h"
 #include "vr.h"
 
 static const int MAXC = 256;
@@ -95,6 +97,155 @@ static unsigned g_capN[2];
 static bool g_camEarly;                     // this frame's camera came from an unrotated object, not yet checked
 static unsigned g_earlyBad[2];              // per eye: frames where the first InvView/View chose another look
 
+// ---- the game's simulation (2007 exe) ----
+// The game steps its simulation (cars, physics, cameras) apart from drawing: a multimedia timer calls
+// 0x81ee50 every 10 ms (100 Hz from its config, [0xf87ffc]), which runs the step 0x81dfd0(game, dt, 0)
+// with dt = the real time since the last step. Frames show whichever step finished last.
+static volatile unsigned __int64* const kSimSteps = (volatile unsigned __int64*)0x10e7a50;  // steps the timer has run
+static const volatile float* const kSimAvgS = (const volatile float*)0x10e7a58;             // their average time, s (1 ms clock, +1 ms)
+static bool g_knownExe;            // the 2007 exe these addresses were checked against
+static unsigned g_stepHist[4];     // frames by how many simulation steps ran since the previous one: 0, 1, 2, 3+
+static std::vector<float> g_frameMs;  // frame times in this status window
+
+// SimLock (tdu_vr.ini): that timer steps at moments unrelated to frames (91/s measured), so a frame
+// shows a state 0-11 ms old, the two eyes of a pair show different states, and a step can land in the
+// middle of drawing a frame (half the scene from before it, half from after). With SimLock the mod
+// stops the game's timer and runs the steps itself, on its own thread, right before each new pair:
+// both eyes see one state, it advances by the real time since the previous pair, and nothing moves
+// while a pair is drawn. The steps run as the timer callback runs them (its pause flags, dt split
+// into steps of at most ~10 ms like its 100 Hz), off the game thread like before: D3D9 lowers the game
+// thread's x87 precision, the physics never ran with that.
+// Outside the car (menus, loading, the house) the mod's thread instead calls the game's own timer
+// callback on an exact 10 ms grid: the game's behaviour, without the old timer's jitter. Locking
+// there stopped the main menu from reacting to Enter.
+typedef void(__stdcall* SimStepFn)(void* game, float dt, float t);
+typedef void(__stdcall* TimerProcFn)(UINT id, UINT msg, DWORD_PTR user, DWORD_PTR dw1, DWORD_PTR dw2);
+static const SimStepFn kSimStep = (SimStepFn)0x81dfd0;
+static const TimerProcFn kTimerProc = (TimerProcFn)0x81ee50;
+static void* const kSimGame = (void*)0x1293880;
+static volatile LONG* const kTimerCtl = (volatile LONG*)0x129bef0;   // the game's timer thread: 1 = stop the timer, 2 = stopped
+static volatile BYTE* const kTimerBusy = (volatile BYTE*)0x10e7c08;  // the timer callback is running
+static volatile LONGLONG* const kTimerLast = (volatile LONGLONG*)0x10e7c00;  // callback: QPC of its last step
+static volatile BYTE* const kSimSkip = (volatile BYTE*)0x129beed;    // callback: no step at all
+static volatile BYTE* const kSimHold1 = (volatile BYTE*)0x129beeb;   // callback: step with dt 0
+static volatile BYTE* const kSimHold2 = (volatile BYTE*)0x129beec;
+static int g_simLock;                // 0 off, 1 waiting for the game's timer to stop, 2 the mod's thread steps
+static volatile bool g_simPairs;     // in the car: steps at each new pair (else every 10 ms through the callback)
+static HANDLE g_simGo, g_simDone;
+static volatile double g_simTarget;  // the steps catch the simulation up to this time
+static volatile LONG g_simSteps;     // steps run at pairs
+static double g_simMs, g_simMaxMs;   // time the game thread waited for them (status window)
+
+static bool sim_code_ok() {
+    // timeSetEvent(period, resolution, 0x81ee50, 0, TIME_PERIODIC) in the timer thread, and the
+    // callback's call of the step with the game object.
+    static const unsigned char a[] = { 0x68, 0x50, 0xEE, 0x81, 0x00 };              // push 0x81ee50
+    static const unsigned char b[] = { 0x68, 0x80, 0x38, 0x29, 0x01, 0xE8 };        // push 0x1293880; call
+    static const unsigned char c[] = { 0x83, 0x3D, 0xF0, 0xBE, 0x29, 0x01, 0x01 };  // cmp dword [0x129bef0], 1
+    __try {
+        return !memcmp((const void*)0x81f14e, a, sizeof a) && !memcmp((const void*)0x81efa4, b, sizeof b) &&
+               !memcmp((const void*)0x81f177, c, sizeof c);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void sim_step(float dt) {
+    if (*kSimSkip) return;
+    kSimStep(kSimGame, *kSimHold1 || *kSimHold2 ? 0.0f : dt, 0.0f);
+    InterlockedIncrement(&g_simSteps);
+}
+
+static double now_s();
+
+static DWORD WINAPI sim_thread(void*) {
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    double last = 0, lastPair = 0, nextTick = now_s();
+    bool wasPairs = false;
+    for (;;) {
+        // Woken at each new pair, or by the 10 ms grid. Nothing until the game's timer has stopped.
+        double wait = nextTick - now_s();
+        if (wait > 0 && timer) {
+            LARGE_INTEGER due;
+            due.QuadPart = -(LONGLONG)(wait * 1e7);
+            SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+        }
+        HANDLE hs[2] = { g_simGo, timer };
+        DWORD r = wait > 0 ? WaitForMultipleObjects(timer ? 2 : 1, hs, FALSE, timer ? 100 : (DWORD)(wait * 1000) + 1) : WAIT_TIMEOUT;
+        bool pair = r == WAIT_OBJECT_0;
+        double tn = now_s();
+        if (!pair && tn >= nextTick) nextTick = tn - nextTick > 0.05 ? tn + 0.01 : nextTick + 0.01;
+        if (g_simLock != 2) {
+            if (pair) SetEvent(g_simDone);
+            continue;
+        }
+        bool pairs = g_simPairs;
+        if (pair) lastPair = tn;
+        // Pairs mode, unless frames stopped coming (a load): then the 10 ms grid takes over.
+        if (pairs && tn - lastPair < 0.05) {
+            if (!wasPairs) last = tn - 0.01;  // the callback stepped until just now
+            wasPairs = true;
+            if (pair) {
+                double target = g_simTarget, dt = target - last;
+                if (dt >= 0.004) {  // like the callback: no steps closer than half its period
+                    if (dt > 0.1) dt = 0.1;  // a long stall: let the world slow down rather than jump
+                    int n = (int)ceil(dt / 0.0105);
+                    for (int i = 0; i < n; i++) sim_step((float)(dt / n));
+                    last = target;
+                }
+            }
+        } else if (!pair) {
+            if (wasPairs) {  // back to the callback: it measures its dt from its last step, make that now
+                LARGE_INTEGER c;
+                QueryPerformanceCounter(&c);
+                *kTimerLast = c.QuadPart;
+                wasPairs = false;
+            }
+            kTimerProc(0, 0, 0, 0, 0);  // the game's own step, as its timer ran it
+        }
+        if (pair) SetEvent(g_simDone);
+    }
+}
+
+// Called at the start of every frame from Present.
+static void sim_frame(bool newPair, bool inCar) {
+    if (g_simLock == 1) {
+        if (*kTimerCtl == 0) InterlockedExchange(kTimerCtl, 1);  // the game (re)initialised it before its timer thread saw the request
+        if (*kTimerCtl == 2 && !*kTimerBusy) {
+            g_simLock = 2;
+            log_printf("SimLock: the game's timer is stopped; the mod steps the simulation (at each eye pair in the car)\n");
+        }
+    }
+    if (g_simPairs != inCar) {
+        g_simPairs = inCar;
+        if (g_simLock == 2) log_printf("SimLock: %s\n", inCar ? "in the car, steps at each eye pair" : "out of the car, steps every 10 ms");
+    }
+    if (g_simLock != 2 || !newPair || !inCar) return;
+    double t0 = now_s();
+    g_simTarget = t0;
+    SetEvent(g_simGo);
+    WaitForSingleObject(g_simDone, 200);
+    double ms = (now_s() - t0) * 1000;
+    g_simMs += ms;
+    if (ms > g_simMaxMs) g_simMaxMs = ms;
+}
+
+static void sim_lock_start() {
+    // shortcut: off by default until tested in the headset while driving; make it the default once it holds up there.
+    if (!g_knownExe || vr_ini_float("SimLock", 0) == 0) { log_printf("SimLock: off\n"); return; }
+    if (!sim_code_ok()) { log_printf("SimLock: off (unknown exe)\n"); return; }
+    g_simGo = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    g_simDone = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    HANDLE th = CreateThread(nullptr, 0, sim_thread, nullptr, CREATE_SUSPENDED, nullptr);
+    if (!th) return;
+    SetThreadPriority(th, THREAD_PRIORITY_HIGHEST);
+    // The game's timer thread checks this every 500 ms, then kills the timer and sets 2.
+    InterlockedExchange(kTimerCtl, 1);
+    g_simLock = 1;
+    ResumeThread(th);
+    log_printf("SimLock: on, waiting for the game's timer to stop\n");
+}
+
 static bool headlook_verify() {
     static const unsigned char a[] = { 0xA0, 0xAC, 0x70, 0x3A, 0x01 };                    // mov al, [0x13a70ac]
     static const unsigned char b[] = { 0xF3, 0x0F, 0x10, 0x1D, 0x3C, 0x40, 0xFA, 0x00 };  // movss xmm3, [0xfa403c]
@@ -164,12 +315,13 @@ static void count(int i) {
 }
 
 // What happened to draws that carry camera matrices.
-enum { R_PAIR, R_OTHER, R_UI, R_POSTFX, R_NOTPERSP, R_SHAPE, R_VIEWPORT, R_FORM, R_NOMAIN, R_PLAIN, R_N };
-static const char* kRName[R_N] = { "rewritten(exact)", "rewritten(recovered)", "2D->screen", "skip:postfx",
+enum { R_PAIR, R_OTHER, R_SAME, R_UI, R_POSTFX, R_NOTPERSP, R_SHAPE, R_VIEWPORT, R_FORM, R_NOMAIN, R_PLAIN, R_N };
+static const char* kRName[R_N] = { "rewritten(exact)", "rewritten(recovered)", "kept(same object)", "2D->screen", "skip:postfx",
                                    "skip:2D-other", "skip:offscreen-shape", "skip:sub-viewport", "skip:not-projection",
                                    "skip:no-camera-yet", "untouched(no camera matrix)" };
 static unsigned g_st[R_N];
-static double g_copyWaitMs, g_submitMs, g_applyMs;  // cumulative ms, for the status line
+static double g_copyWaitMs, g_submitMs, g_applyMs, g_readbackMs;  // cumulative ms, for the status line
+static double g_presentMs, g_presentMax;                           // time inside the real Present
 
 static double now_s() {
     static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
@@ -181,7 +333,7 @@ static double now_s() {
 static void log_status() {
     static double t0 = now_s(), last = t0;
     static unsigned lastFrame, lastSt[R_N], lastDraw;
-    static double lastWait, lastSubmit, lastApply;
+    static double lastWait, lastSubmit, lastApply, lastReadback;
     double t = now_s();
     if (t - last < 5.0) return;
     unsigned frames = g_frame - lastFrame;
@@ -191,18 +343,42 @@ static void log_status() {
         s += " " + std::string(kRName[i]) + "=" + std::to_string((unsigned)((g_st[i] - lastSt[i]) * perF + 0.5));
         lastSt[i] = g_st[i];
     }
-    log_printf("t=%.0fs %.1f fps | per frame: mod draw hooks %.2f ms, copy wait %.2f ms, publish %.2f ms | draws/frame %u:%s | main vfov %.1f\n",
-               t - t0, frames / (t - last), (g_applyMs - lastApply) * perF, (g_copyWaitMs - lastWait) * perF,
+    log_printf("t=%.0fs %.1f fps | per frame: mod draw hooks %.2f ms, %s %.2f ms, copy wait %.2f ms, publish %.2f ms | draws/frame %u:%s | main vfov %.1f\n",
+               t - t0, frames / (t - last), (g_applyMs - lastApply) * perF, gpu_on() ? "GPU copy" : "readback calls",
+               (g_readbackMs - lastReadback) * perF, (g_copyWaitMs - lastWait) * perF,
                (g_submitMs - lastSubmit) * perF, (unsigned)((g_cnt[C_DRAW] - lastDraw) * perF + 0.5), s.c_str(),
                g_haveMain ? 2 * atan(1 / g_mainP.m[1][1]) * 57.2958 : 0.0);
+    lastReadback = g_readbackMs;
+    if (!g_frameMs.empty()) {
+        std::sort(g_frameMs.begin(), g_frameMs.end());
+        auto pct = [](double p) { return g_frameMs[(size_t)(p * (g_frameMs.size() - 1))]; };
+        static unsigned __int64 lastSteps;
+        unsigned __int64 steps = 0;
+        float avg = 0;
+        if (g_knownExe) { steps = (unsigned __int64)g_simSteps + *kSimSteps; avg = *kSimAvgS; }
+        char simBuf[96];
+        if (g_simLock == 2 && g_simPairs) snprintf(simBuf, sizeof simBuf, "at eye pairs, game thread waited %.2f ms/frame (max %.1f)", g_simMs * perF, g_simMaxMs);
+        else snprintf(simBuf, sizeof simBuf, "%s timer (avg %.1f ms incl. +1)", g_simLock == 2 ? "10 ms" : "game", avg * 1000);
+        log_printf("  frame ms p50 %.1f p90 %.1f p99 %.1f max %.1f, in Present %.2f avg %.1f max | game steps %.0f/s, %s, frames after 0/1/2/3+ steps: %u/%u/%u/%u\n",
+                   pct(0.5), pct(0.9), pct(0.99), g_frameMs.back(), g_presentMs * perF, g_presentMax,
+                   lastSteps ? (steps - lastSteps) / (t - last) : 0.0, simBuf,
+                   g_stepHist[0], g_stepHist[1], g_stepHist[2], g_stepHist[3]);
+        lastSteps = steps;
+        g_simMs = g_simMaxMs = 0;
+        g_presentMs = g_presentMax = 0;
+        g_frameMs.clear();
+        memset(g_stepHist, 0, sizeof g_stepHist);
+    }
     if (g_vr) log_printf("  %s\n", vr_status());
+    if (g_vr && gpu_on()) log_printf("  %s\n", gpu_status());
     if (g_headLook) {
         static unsigned lastFixes;
         log_printf("  head look: yaw %+.1f pitch %+.1f deg, camera object %s, corrected %u frames | rendered with another look than read:"
-                   " left %u/%u, right %u/%u frames (unmatched %u/%u), known by 3D draw %.1f/%.1f, early pick corrected %u/%u\n",
+                   " left %u/%u, right %u/%u frames (unmatched %u/%u), known by 3D draw %.1f/%.1f, early pick corrected %u/%u | camera at %.1f %.1f %.1f\n",
                    g_appliedYaw * 57.2958f, g_appliedPitch * 57.2958f, g_camObj ? "found" : "not found", g_lookFixes - lastFixes,
                    g_rcFix[0], g_rcN[0], g_rcFix[1], g_rcN[1], g_rcBad[0], g_rcBad[1],
-                   g_capN[0] ? g_capSum[0] / g_capN[0] : -1.0, g_capN[1] ? g_capSum[1] / g_capN[1] : -1.0, g_earlyBad[0], g_earlyBad[1]);
+                   g_capN[0] ? g_capSum[0] / g_capN[0] : -1.0, g_capN[1] ? g_capSum[1] / g_capN[1] : -1.0, g_earlyBad[0], g_earlyBad[1],
+                   g_cam.m[3][0], g_cam.m[3][1], g_cam.m[3][2]);
         lastFixes = g_lookFixes;
         g_rcN[0] = g_rcN[1] = g_rcFix[0] = g_rcFix[1] = g_rcBad[0] = g_rcBad[1] = 0;
         g_capSum[0] = g_capSum[1] = 0;
@@ -256,8 +432,16 @@ static const Mat4& pe_for(float m22, float m32, float sgn) {
     return e.Pe;
 }
 
+// The last rewrite: for which shader, with which eye matrices (g_eyeGen counts new_frame_matrices).
+// When the next draw uses that shader and the game has not set any of its matrix registers since,
+// the registers still hold exactly what a rewrite would write (the game draws an object in several
+// pieces with the same transform): nothing to do.
+static const ShaderMats* g_rwShader;
+static unsigned g_rwGen, g_eyeGen;
+
 // New eye/pose: refresh the eye matrices and drop cached frustums.
 static void new_frame_matrices() {
+    g_eyeGen++;
     g_invEyeLH = m4_flip_z(g_ev.invEye);
     m4_inverse(g_ev.invEye, g_ERH);
     m4_inverse(g_invEyeLH, g_ELH);
@@ -601,6 +785,16 @@ static void rewrite(IDirect3DDevice9* d, const ShaderMats* s, float a, float b, 
         }
         write_mat(d, m, R);
     }
+    g_rwShader = s;
+    g_rwGen = g_eyeGen;
+}
+
+static bool rewrite_still_valid(const ShaderMats* s) {
+    if (s != g_rwShader || g_rwGen != g_eyeGen) return false;
+    for (auto& m : s->mats)
+        for (int j = 0; j < (m.count > 4 ? 4 : m.count); j++)
+            if (m.reg + j < MAXC && !g_isMod[m.reg + j]) return false;
+    return true;
 }
 
 // A full-screen 2D draw (menu, HUD, cursor): move it onto the virtual screen for this eye.
@@ -645,6 +839,7 @@ static void apply_body(IDirect3DDevice9* d) {
     bool shapeOK = std::fabs((double)g_rtW * g_bbH - (double)g_rtH * g_bbW) <= 0.02 * g_rtW * g_bbH;
     bool fullVP = g_vp.Width * 10 >= g_rtW * 9 && g_vp.Height * 10 >= g_rtH * 9;
     if (!shapeOK) { g_st[R_SHAPE]++; restore_stale(d, nullptr); return; }
+    if (fullVP && rewrite_still_valid(s)) { g_st[R_SAME]++; g_n3d++; return; }
 
     if (s->pairK >= 0 && s->pairV >= 0) {
         // Exact and cheap: X = Y*P  ->  X' = (Y*invEye) * Peye, with P's depth terms kept.
@@ -715,22 +910,28 @@ static void read_bb_size(IDirect3DDevice9* d) {
 
 // TDUVR_DUMP=<file.bmp>[,<seconds>]: write one eye image, exactly as sent to the headset, for checking.
 // ",+<seconds>" counts from when head look found the in-car camera (the attract demo starts at random times).
-static void maybe_dump(const void* bits, int pitch, int w, int h) {
+static char g_dumpPath[MAX_PATH + 16];
+static bool dump_due() {
     static bool done;
     static double t0 = now_s(), tCam;
-    char env[MAX_PATH + 16];
-    if (done || GetEnvironmentVariableA("TDUVR_DUMP", env, sizeof env) == 0) return;
+    char* env = g_dumpPath;
+    if (done || GetEnvironmentVariableA("TDUVR_DUMP", env, sizeof g_dumpPath) == 0) return false;
     char* comma = strrchr(env, ',');
     double after = comma ? atof(comma + 1) : 60;
     if (comma && comma[1] == '+') {
-        if (!g_camObj) return;
+        if (!g_camObj) return false;
         if (!tCam) tCam = now_s();
-        if (now_s() - tCam < after) return;
+        if (now_s() - tCam < after) return false;
     } else if (now_s() - t0 < after) {
-        return;
+        return false;
     }
     if (comma) *comma = 0;
     done = true;
+    return true;
+}
+
+static void write_bmp(const void* bits, int pitch, int w, int h) {
+    const char* env = g_dumpPath;
     FILE* f = nullptr;
     if (fopen_s(&f, env, "wb") || !f) return;
     BITMAPFILEHEADER fh{};
@@ -753,16 +954,25 @@ static void finish_slot(Slot& s) {
     D3DLOCKED_RECT lr;
     if (SUCCEEDED(s.sys->lpVtbl->LockRect(s.sys, &lr, nullptr, D3DLOCK_READONLY))) {
         vr_publish(s.eye, s.pair, s.pose, lr.pBits, lr.Pitch, (int)g_copyW, (int)g_copyH);
-        maybe_dump(lr.pBits, lr.Pitch, (int)g_copyW, (int)g_copyH);
+        if (dump_due()) write_bmp(lr.pBits, lr.Pitch, (int)g_copyW, (int)g_copyH);
         s.sys->lpVtbl->UnlockRect(s.sys);
     }
     g_submitMs += (now_s() - t1) * 1000;
     s.pending = false;
 }
 
-// shortcut: still a CPU copy (GPU -> system memory -> D3D11), just not stalling any more; move to
-// D3D9On12 (GPU-only copy) if high resolutions stay slow.
+// GPU path (D3D9On12, GpuCopy=1): the back buffer is copied into an eye image on the GPU. CPU path
+// (plain d3d9): GPU -> system memory -> D3D11, 15 MB per frame at 2560x1440, and GetRenderTargetData
+// can hold the game thread until the GPU has caught up.
+static struct { bool pending; int eye; unsigned pair; FramePose pose; } g_gpuFrame;  // captured, finished after Present
+
 static void submit_backbuffer(IDirect3DDevice9* d) {
+    if (gpu_on()) {
+        double t = now_s();
+        g_gpuFrame = { gpu_capture(d), g_eye, g_frame >> 1, g_framePose };
+        g_readbackMs += (now_s() - t) * 1000;
+        return;
+    }
     IDirect3DSurface9* bb = nullptr;
     if (FAILED(d->lpVtbl->GetBackBuffer(d, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
     D3DSURFACE_DESC dd;
@@ -775,9 +985,12 @@ static void submit_backbuffer(IDirect3DDevice9* d) {
     if (!g_slot[0].rt || g_copyW != dd.Width || g_copyH != dd.Height || g_copyFmt != dd.Format) {
         release_copies();
         for (auto& s : g_slot) {
-            d->lpVtbl->CreateRenderTarget(d, dd.Width, dd.Height, dd.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &s.rt, nullptr);
-            d->lpVtbl->CreateOffscreenPlainSurface(d, dd.Width, dd.Height, dd.Format, D3DPOOL_SYSTEMMEM, &s.sys, nullptr);
-            d->lpVtbl->CreateQuery(d, D3DQUERYTYPE_EVENT, &s.q);
+            HRESULT h1 = d->lpVtbl->CreateRenderTarget(d, dd.Width, dd.Height, dd.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &s.rt, nullptr);
+            HRESULT h2 = d->lpVtbl->CreateOffscreenPlainSurface(d, dd.Width, dd.Height, dd.Format, D3DPOOL_SYSTEMMEM, &s.sys, nullptr);
+            HRESULT h3 = d->lpVtbl->CreateQuery(d, D3DQUERYTYPE_EVENT, &s.q);
+            static int fails;
+            if ((FAILED(h1) || FAILED(h2) || FAILED(h3)) && fails++ < 3)  // E_OUTOFMEMORY: the 2 GB address space is full
+                log_printf("readback surfaces %ux%u: render target 0x%08lx, system memory 0x%08lx, query 0x%08lx\n", dd.Width, dd.Height, h1, h2, h3);
         }
         g_copyW = dd.Width;
         g_copyH = dd.Height;
@@ -788,8 +1001,10 @@ static void submit_backbuffer(IDirect3DDevice9* d) {
     Slot& prev = g_slot[(g_frame & 1) ^ 1];
     if (cur.rt && cur.sys && cur.q) {
         if (cur.pending) finish_slot(cur);
+        double tr = now_s();
         HRESULT h1 = d->lpVtbl->StretchRect(d, bb, nullptr, cur.rt, nullptr, D3DTEXF_NONE);
         HRESULT h2 = SUCCEEDED(h1) ? d->lpVtbl->GetRenderTargetData(d, cur.rt, cur.sys) : E_FAIL;
+        g_readbackMs += (now_s() - tr) * 1000;
         if (SUCCEEDED(h2)) {
             cur.q->lpVtbl->Issue(cur.q, D3DISSUE_END);
             cur.pending = true;
@@ -861,12 +1076,26 @@ static int g_autoStage;  // 1 at the main menu, 2 in the house, 0 done or off
 static HWND g_gameWnd;
 
 static void auto_drive(unsigned draws, unsigned draws3d) {
-    static double tStart = now_s(), tSince = tStart, tUp;
+    static double tStart = now_s(), tSince = tStart, tUp, tCar;
     static BYTE held;
     double t = now_s();
     if (held && t >= tUp) {
         keybd_event(held, (BYTE)MapVirtualKeyA(held, MAPVK_VK_TO_VSC), KEYEVENTF_KEYUP, 0);
         held = 0;
+    }
+    // TDUVR_DRIVETEST=<seconds>: that long after the in-car camera is found, hold the accelerator
+    // (Up) for 5 s, to see the car move in a test without a headset.
+    static char dt[16];
+    static bool driveTest = GetEnvironmentVariableA("TDUVR_DRIVETEST", dt, sizeof dt) > 0;
+    if (driveTest && !held && g_camObj && GetForegroundWindow() == g_gameWnd) {
+        if (!tCar) tCar = t;
+        if (t - tCar > atof(dt)) {
+            driveTest = false;
+            held = VK_UP;
+            keybd_event(held, (BYTE)MapVirtualKeyA(held, MAPVK_VK_TO_VSC), 0, 0);
+            tUp = t + 5;
+            log_printf("drive test: holding Up for 5 s\n");
+        }
     }
     if (!g_autoStage || held) return;
     if (t - tStart > 300) { g_autoStage = 0; log_printf("auto drive: gave up\n"); return; }
@@ -884,6 +1113,18 @@ static void auto_drive(unsigned draws, unsigned draws3d) {
 }
 
 static void on_present(IDirect3DDevice9* d) {
+    {
+        static double tPrev;
+        static unsigned __int64 stepsPrev;
+        double tn = now_s();
+        if (tPrev > 0) g_frameMs.push_back((float)((tn - tPrev) * 1000));
+        tPrev = tn;
+        if (g_knownExe) {
+            unsigned __int64 s = (unsigned __int64)g_simSteps + *kSimSteps;  // pair steps + the callback's
+            g_stepHist[s - stepsPrev < 3 ? (int)(s - stepsPrev) : 3]++;
+            stepsPrev = s;
+        }
+    }
     log_status();
     if (g_vr) {
         static unsigned lastDraws, last3d;
@@ -920,6 +1161,7 @@ static void on_present(IDirect3DDevice9* d) {
             g_fedYaw[g_fedN & 3] = yaw;
             g_fedPitch[g_fedN & 3] = pitch;
         }
+        sim_frame(g_eye == 0, inCar);  // SimLock: the pair's steps, after its look is fed so its camera uses it
         // Assume the in-car camera applies what we just fed until it says otherwise (first draw).
         g_appliedYaw = inCar ? yaw : 0;
         g_appliedPitch = inCar ? pitch : 0;
@@ -955,12 +1197,32 @@ static void clear_frame(IDirect3DDevice9* d) {
     bb->lpVtbl->Release(bb);
 }
 
+// GPU path: the second half of the copy, once Present has submitted the frame's work.
+static void finish_gpu_frame() {
+    if (!g_gpuFrame.pending) return;
+    g_gpuFrame.pending = false;
+    double t = now_s();
+    bool ok = gpu_finish(g_gpuFrame.eye, g_gpuFrame.pair, g_gpuFrame.pose);
+    g_readbackMs += (now_s() - t) * 1000;
+    if (ok && dump_due()) gpu_read_eye(g_gpuFrame.eye, write_bmp);
+}
+
+// GPU copy: the game's frames are not shown on the desktop. D3D9On12's Present to the game window
+// blocked ~300 ms on every other frame (measured, with or without V-Sync: 6 fps), and the headset
+// gets its images from the GPU copy anyway. The window keeps the last frame shown before VR started.
+static bool skip_desktop() { return g_vr && gpu_on(); }
+
 static HRESULT STDMETHODCALLTYPE hPresent(IDirect3DDevice9* d, const RECT* a, const RECT* b, HWND w, const RGNDATA* r) {
     count(C_PRESENT);
     on_present(d);
     g_inPresent = true;
-    HRESULT hr = H(d).Present(d, a, b, w, r);
+    double tp = now_s();
+    HRESULT hr = skip_desktop() ? S_OK : H(d).Present(d, a, b, w, r);
+    tp = (now_s() - tp) * 1000;
+    g_presentMs += tp;
+    if (tp > g_presentMax) g_presentMax = tp;
     g_inPresent = false;
+    finish_gpu_frame();
     if (g_vr && SUCCEEDED(hr)) clear_frame(d);
     return hr;
 }
@@ -973,7 +1235,12 @@ static HRESULT STDMETHODCALLTYPE hSCPresent(IDirect3DSwapChain9* sc, const RECT*
     if (FAILED(sc->lpVtbl->GetDevice(sc, &d)) || !d) return oSCPresent(sc, a, b, w, r, f);
     if (d != g_watchDev) { d->lpVtbl->Release(d); return oSCPresent(sc, a, b, w, r, f); }  // another device's swap chain (shared vtable)
     on_present(d);
-    HRESULT hr = oSCPresent(sc, a, b, w, r, f);
+    double tp = now_s();
+    HRESULT hr = skip_desktop() ? S_OK : oSCPresent(sc, a, b, w, r, f);
+    tp = (now_s() - tp) * 1000;
+    g_presentMs += tp;
+    if (tp > g_presentMax) g_presentMax = tp;
+    finish_gpu_frame();
     if (g_vr && SUCCEEDED(hr)) clear_frame(d);
     d->lpVtbl->Release(d);
     return hr;
@@ -992,6 +1259,7 @@ static void hook_device(IDirect3DDevice9* d);
 
 static HRESULT STDMETHODCALLTYPE hReset(IDirect3DDevice9* d, D3DPRESENT_PARAMETERS* pp) {
     release_copies();
+    gpu_release();
     g_rtTex.clear();  // render targets must be released before Reset; the game recreates them after
     g_tex0 = nullptr;
     force_pp(pp);
@@ -1156,7 +1424,9 @@ static DWORD WINAPI watch_thread(void*) {
     }
 }
 
-static HRESULT STDMETHODCALLTYPE hCreateDevice(IDirect3D9* This, UINT ad, D3DDEVTYPE t, HWND w, DWORD f, D3DPRESENT_PARAMETERS* pp, IDirect3DDevice9** out) {
+// SteamVR and the settings, once, at the game's first Direct3DCreate9: whether VR is on decides
+// whether the game's D3D9 runs on D3D12 (GPU copy).
+static void init_once() {
     static bool tried;
     if (!tried) {
         tried = true;
@@ -1167,41 +1437,67 @@ static HRESULT STDMETHODCALLTYPE hCreateDevice(IDirect3D9* This, UINT ad, D3DDEV
             if (!(g_uiFov >= 20 && g_uiFov <= 120)) g_uiFov = 70.0f;
             if (!(g_uiDist >= 0.3f && g_uiDist <= 20)) g_uiDist = 1.5f;
             log_printf("UI screen: %.0f deg wide at %.2f m\n", g_uiFov, g_uiDist);
-            g_headLook = vr_ini_float("HeadLook", 1) != 0 && headlook_verify();
+            g_knownExe = headlook_verify();
+            g_headLook = vr_ini_float("HeadLook", 1) != 0 && g_knownExe;
             g_lookTest = GetEnvironmentVariableA("TDUVR_LOOKTEST", nullptr, 0) > 0;
             log_printf("head look: %s%s\n", g_headLook ? "on" : "off (setting or unknown exe)", g_lookTest ? ", TEST MODE" : "");
             if (g_headLook && !g_lookTest) CreateThread(nullptr, 0, cam_finder, nullptr, 0, nullptr);
             g_autoStage = vr_ini_float("AutoDrive", 1) != 0 ? 1 : 0;
             log_printf("auto drive: %s\n", g_autoStage ? "on" : "off");
+            sim_lock_start();
+            // In the headset nobody touches mouse or keyboard (and a gamepad doesn't count as input to
+            // Windows): keep the monitor from going to sleep, which loses a plain D3D9 device.
+            SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
             vr_begin_frame(0, true, g_maxYaw, g_maxPitch, g_lookTilt, &g_ev, &g_framePose);
             vr_eye_for_look(0, 0, 0, g_lookTilt, &g_ev);
             new_frame_matrices();
         }
     }
+}
+
+static HMODULE real_d3d9();
+
+static HRESULT STDMETHODCALLTYPE hCreateDevice(IDirect3D9* This, UINT ad, D3DDEVTYPE t, HWND w, DWORD f, D3DPRESENT_PARAMETERS* pp, IDirect3DDevice9** out) {
+    init_once();
     auto real = g_d3dOrig[0].CreateDevice;
     for (int i = 0; i < g_nD3D && i < 16; i++) if (g_d3dOrig[i].vt == This->lpVtbl) real = g_d3dOrig[i].CreateDevice;
     // In the house the game opens a tiny second device (120x61) while the main one keeps drawing.
     // Taking it over reset the mod's state (back buffer size, copies) and crashed in d3d9's shared
-    // vtable, so a device too small to be the game's view is left alone.
+    // vtable, so a device too small to be the game's view is left alone. With the GPU copy it gets
+    // plain d3d9: its own Present to the desktop would stall in D3D9On12 like the main one's.
     UINT bw = pp ? pp->BackBufferWidth : 0;
     HWND cw = pp && pp->hDeviceWindow ? pp->hDeviceWindow : w;
     RECT cr;
     if (!bw && cw && GetClientRect(cw, &cr)) bw = (UINT)(cr.right - cr.left);
     if (g_vr && bw && bw < 320) {
-        HRESULT hr = real(This, ad, t, w, f, pp, out);
-        log_printf("small extra device %ux%u (hr=0x%08lx): left alone\n", bw, pp ? pp->BackBufferHeight : 0, hr);
+        IDirect3D9* by = This;
+        if (gpu_on()) {
+            static IDirect3D9* native = [] {
+                auto fn = (IDirect3D9*(WINAPI*)(UINT))GetProcAddress(real_d3d9(), "Direct3DCreate9");
+                return fn ? fn(D3D_SDK_VERSION) : nullptr;
+            }();
+            if (native) by = native;  // same d3d9.dll class: the original CreateDevice works on it
+        }
+        HRESULT hr = real(by, ad, t, w, f, pp, out);
+        log_printf("small extra device %ux%u (hr=0x%08lx%s): left alone\n", bw, pp ? pp->BackBufferHeight : 0, hr, by != This ? ", plain d3d9" : "");
         return hr;
     }
     force_pp(pp);
     if (w) g_gameWnd = w;
     else if (pp && pp->hDeviceWindow) g_gameWnd = pp->hDeviceWindow;
     release_copies();  // they belong to the previous device
+    gpu_release();
     for (int r : g_mod) g_isMod[r] = false;
     g_mod.clear();
     g_cur = nullptr;
     HRESULT hr = real(This, ad, t, w, f, pp, out);
     log_printf("CreateDevice hr=0x%08lx type %d flags 0x%lx %ux%u windowed %d\n", hr, t, f,
                pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0, pp ? pp->Windowed : -1);
+    if (FAILED(hr) && pp)
+        log_printf("  failed with: adapter %u of %u, format %d x%u, multisample %d/%lu, swap effect %d, window %p/%p, depth %d/%d, flags 0x%lx, refresh %u, interval 0x%x\n",
+                   ad, This->lpVtbl->GetAdapterCount(This), pp->BackBufferFormat, pp->BackBufferCount, pp->MultiSampleType, pp->MultiSampleQuality, pp->SwapEffect,
+                   (void*)pp->hDeviceWindow, (void*)w, pp->EnableAutoDepthStencil, pp->AutoDepthStencilFormat, pp->Flags,
+                   pp->FullScreen_RefreshRateInHz, pp->PresentationInterval);
     // No headset: stay out of the game's way. (Fullscreen d3d9 swaps the device's vtable to its shared
     // one and frees devices on mode switches; the watcher re-hooking those crashed the game.)
     if (SUCCEEDED(hr) && out && *out && g_vr) {
@@ -1256,7 +1552,18 @@ static HMODULE real_d3d9() {
 
 extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT sdk) {
     auto fn = (IDirect3D9*(WINAPI*)(UINT))GetProcAddress(real_d3d9(), "Direct3DCreate9");
-    IDirect3D9* d3d = fn ? fn(sdk) : nullptr;
+    // GpuCopy=1 (tdu_vr.ini) and SteamVR running: run the game's D3D9 on D3D12 (D3D9On12), so the eye
+    // images never pass through system memory. Decided here, before the game has a device. Never
+    // without VR: 9On12 then has to show the game on the desktop, and its Present stalls (see hPresent).
+    init_once();
+    static int gpuWanted = -1;
+    if (gpuWanted < 0) {
+        gpuWanted = g_vr && vr_ini_float("GpuCopy", 1) != 0;
+        log_printf("GPU copy (D3D9On12): %s\n", gpuWanted ? "on" : "off");
+    }
+    IDirect3D9* d3d = gpuWanted ? (IDirect3D9*)gpu_create_d3d9(real_d3d9(), sdk) : nullptr;
+    if (gpuWanted && !d3d) { gpuWanted = 0; log_printf("GPU copy: D3D9On12 unavailable, using the CPU copy\n"); }
+    if (!d3d && fn) d3d = fn(sdk);
     log_printf("Direct3DCreate9 -> %p vtable %p\n", (void*)d3d, d3d ? (const void*)d3d->lpVtbl : nullptr);
     if (d3d && d3d->lpVtbl->CreateDevice != hCreateDevice) {
         int slot = -1;

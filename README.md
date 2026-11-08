@@ -28,8 +28,16 @@ A `d3d9.dll` proxy for Test Drive Unlimited (PC, 2007 exe). It puts the game in 
   - Log line `head look:` shows: `rendered with another look than read` (frames corrected, per eye), `unmatched` (no exact match; the nearest state within 1° is used), `known by 3D draw` (should be about 0) and `early pick corrected` (should stay 0).
   - The menu/HUD screen stays fixed in front of you; it doesn't turn with the game camera.
 - **Positions never depend on noisy depth terms.** Per-draw depth terms carry float noise (the near plane wanders by about 1.5%). WorldView is rebuilt from WorldViewProj using only the FOV scales, so the depth terms only affect depth. They're snapped to the frame's few real depth ranges, so each range gets one bit-identical frustum.
-- **Stereo is alternate-eye rendering:** even frames are rendered for one eye, odd frames for the other. Both frames of a pair use the same head pose, and the presenter only shows a left/right pair from the same pair. So it doesn't matter whether SteamVR reprojects each eye with its own pose or with one shared pose.
-- **A presenter thread feeds SteamVR.** The back buffer is copied through system memory with a one-frame lag and handed to a presenter thread. Every headset frame, that thread submits the newest image of each eye with its render pose. So the compositor always gets a complete frame on time and only has to reproject head motion. Meanwhile the game runs at its own rate and never waits on the headset.
+- **Stereo is alternate-eye rendering:** even frames are rendered for one eye, odd frames for the other. Both frames of a pair use the same head pose, and the presenter only shows a left/right pair from the same pair. So it doesn't matter whether SteamVR reprojects each eye with its own pose or with one shared pose. Each eye therefore gets a new image at half the game's frame rate: the game's FPS is what decides how smooth it feels, not the 90 Hz the headset shows.
+- **The frames stay on the GPU (`GpuCopy=1`).** The game's Direct3D 9 runs on a Direct3D 12 device of the mod's (Windows' D3D9On12). At each Present the back buffer is copied into an eye image on the GPU, and the presenter hands those D3D12 textures straight to SteamVR. The old CPU copy took the game from about 150 to about 85 fps at 2560x1440: `GetRenderTargetData` makes the game wait for the GPU every frame, plus 15 MB per frame through system memory.
+  - The game window on the desktop stops updating in this mode: D3D9On12's Present to a window blocked for ~300 ms on every other frame (6 fps), and the headset doesn't need it. Use SteamVR's mirror window to watch.
+  - Taking the copy out of 9On12 (`UnwrapUnderlyingResource`) waits until 9On12's worker thread has caught up with the game, about 1.5 ms per frame. 9On12 also adds some cost to every draw. Measured parked in the car at 2560x1440 without a headset: about 100 fps, p99 frame 11 ms.
+  - 9On12 keeps every fence it is handed back with a resource, so handing back the same render target got slower each frame (~10 ms per frame after an hour). The render target is replaced every 1024 frames.
+  - The game exe is not large-address-aware, so it has 2 GB of address space and uses ~1.7 GB with plain d3d9. The CPU copy's buffers sometimes didn't fit. With 9On12 the game uses ~1.2 GB.
+  - In the house the game opens a second, tiny device. It gets plain d3d9, since its Present would stall in 9On12 as well.
+- **A presenter thread feeds SteamVR.** Every headset frame, it submits the newest finished image of each eye with its render pose. So the compositor always gets a complete frame on time and only has to reproject head motion. Meanwhile the game runs at its own rate and never waits on the headset. With `GpuCopy=0` the back buffer goes through system memory with a one-frame lag instead.
+- **The game's simulation runs on its own timer.** A multimedia timer calls 0x81ee50 every 10 ms (100 Hz, from the game's config), which steps cars, physics and cameras with dt = the real time since the last step (0x81dfd0). Rendering just shows whichever step finished last. Measured: the timer really runs 91 steps/s, at moments unrelated to frames. So a frame shows a state up to 11 ms old, the two eyes of a pair show different moments, and a step can land halfway through drawing a frame.
+  - `SimLock=1` (experimental) stops the game's timer and steps from the mod's own thread instead. In the car, the steps run right before each new eye pair, catching up the real time since the previous pair in steps of at most 10 ms. Both eyes then show the same moment, and nothing moves while a pair is drawn. Elsewhere (menus, loading, the house) the thread calls the game's own timer callback on an exact 10 ms grid. Stepping at pairs in the main menu stopped it reacting to Enter.
 - Quest via Link, Air Link or Virtual Desktop works through SteamVR. SteamVR's OpenXR runtime has no 32-bit support, so OpenVR is used.
 
 ## Install
@@ -44,7 +52,9 @@ Needs the PC version of Test Drive Unlimited (the 2007 exe this was made against
 To uninstall, delete those three files.
 
 ## Settings that matter
-Each eye gets every other game frame, so each eye's picture updates at **half the game's FPS**. TDU at 1920x1080 runs at about 90–100 fps with the mod on an RTX 4070 Super, so each eye gets about 45 new images per second. Head rotation is still reprojected at the full headset rate.
+Each eye gets every other game frame, so each eye's picture updates at **half the game's FPS**. Head rotation is still reprojected at the full headset rate, but everything that moves in the scene (and at speed, that's everything) only updates at half the game's FPS. That's why it can feel well below 90 even though Virtual Desktop shows 90. The status lines in `tdu_vr.log` show both: `fps` (the game) and `new pairs shown` (what each eye gets).
+- `GpuCopy=1` (the default) is the biggest win: see above.
+- If another frame limiter or overlay hooks the game (for example framepacer), exclude `TestDriveUnlimited.exe` from it. It sits in the same Present call.
 
 **Frame generation must be off.** Both SteamVR's **Motion Smoothing** and Virtual Desktop's **SSW** force the app to half rate and invent the in-between frames from motion. With alternate-eye images that warps, stretches and wobbles the world.
 
@@ -57,6 +67,8 @@ The `SteamVR:` part of the status lines in `tdu_vr.log` should read `throttled 0
 
 ## Testing without the headset
 Environment variables, set before launching the game:
+- `TDUVR_NOHMD=1`: no SteamVR at all. A simulated 90 Hz Quest 3 takes its place, and everything else runs as in the headset: rewrite, GPU copy, presenter (without submitting). The log's status lines then show what the mod costs.
+- `TDUVR_DRIVETEST=<seconds>`: that long after the in-car camera is found, hold the accelerator for 5 s. The `camera at` part of the log's head-look line shows whether the car moved.
 - `TDUVR_FAKEHEAD=<degrees>,<seconds>`: the head looks straight ahead and turns left/right by that much once per period (`0,4` holds still). Otherwise a headset lying on the desk points anywhere.
 - `TDUVR_DUMP=<file.bmp>,<seconds>`: writes one eye image exactly as sent to the headset. `,+<seconds>` counts from when the in-car camera is found.
 - `TDUVR_LOOKTEST=1`: cycles fixed head-look angles and logs the camera the game produced.
@@ -67,5 +79,6 @@ With `AutoDrive=1`, a launch reaches the in-car view on its own. Keep the game w
 - **Edge culling.** Objects culled by the game's sphere test (about 44° either side of where the game camera looks) can pop at the outer edges of the headset view (up to 55° out) and past the head-look limits (97° yaw, 30° pitch). Widening the game's FOV is not a fix: its camera FOV (set at 0x404840, called from 0x8d696e) also drives level of detail, and at 120° distant signs vanish and trees switch models.
 - **HUD and menu sharpness.** The virtual screen is drawn at the game's resolution and then squeezed into part of the eye image, so small text can be soft. Raising `UiFov` makes it bigger. Screen-space effects drawn as 2D with plain textures, such as lens flares, would land on the virtual screen too.
 - **Alternate-eye artifacts.** At high speed, side scenery can shimmer, because each eye's image comes from a different frame.
-- **CPU copy.** It no longer stalls, but at high resolutions it still costs a few milliseconds per frame. The next step is a GPU-only copy through D3D9On12.
+- **Half-rate eyes.** Alternate-eye rendering gives each eye half the game's FPS. Real 90 Hz per eye needs either 180 game fps or both eyes drawn in one frame (each main-view draw issued twice, into two render targets). That's the next big step.
+- **GPU copy costs.** D3D9On12 costs about 1.5 ms per frame to sync with its worker thread, plus some per-draw overhead. It's still far cheaper than the CPU copy, which made the game wait for the GPU every frame.
 - **Lighting.** Per-pixel lighting, specular and mirrors use the original camera, so small errors appear when you lean far.
