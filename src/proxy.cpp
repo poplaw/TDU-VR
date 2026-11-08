@@ -1320,6 +1320,10 @@ static void apply(IDirect3DDevice9* d) {
 }
 
 // ---- back buffer -> headset ----
+static IDirect3DSurface9* g_mirror;  // the desktop window's picture (see mirror_eye)
+static bool g_mirrorOk;
+static HWND g_gameWnd;
+
 static void release_copies() {
     for (auto& s : g_slot) {
         if (s.rt) s.rt->lpVtbl->Release(s.rt);
@@ -1327,6 +1331,35 @@ static void release_copies() {
         if (s.q) s.q->lpVtbl->Release(s.q);
         s = Slot{};
     }
+    if (g_mirror) g_mirror->lpVtbl->Release(g_mirror);
+    g_mirror = nullptr;
+    g_mirrorOk = false;
+}
+
+// The desktop window shows the left eye only: both eyes in turn looked like two pictures at once. The
+// back buffer holds the eye's whole frustum (about square, stretched to the game's resolution), so the
+// picture is cut to the window's shape around where the eye looks; the right eye's frames show it again.
+// Called after the eye's copy for the headset is queued, before Present.
+static void mirror_eye(IDirect3DDevice9* d) {
+    if (g_eye && !g_mirrorOk) return;
+    IDirect3DSurface9* bb = nullptr;
+    if (FAILED(d->lpVtbl->GetBackBuffer(d, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) return;
+    D3DSURFACE_DESC dd;
+    bb->lpVtbl->GetDesc(bb, &dd);
+    if (!g_mirror && FAILED(d->lpVtbl->CreateRenderTarget(d, dd.Width, dd.Height, dd.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &g_mirror, nullptr)))
+        g_mirror = nullptr;
+    if (g_mirror && g_eye == 0) {
+        RECT wr;  // Present stretches the back buffer onto the window, which needn't have its shape
+        float aspect = g_gameWnd && GetClientRect(g_gameWnd, &wr) && wr.bottom > 0 ? (float)wr.right / wr.bottom : (float)dd.Width / dd.Height;
+        float v = g_ev.up < g_ev.down ? g_ev.up : g_ev.down;
+        float hx = -g_ev.l < g_ev.r ? -g_ev.l : g_ev.r, hy = hx / aspect;  // half-width/height as tangents
+        if (hy > v) { hy = v; hx = v * aspect; }
+        float sx = dd.Width / (g_ev.r - g_ev.l), sy = dd.Height / (g_ev.up + g_ev.down);
+        RECT src = { (LONG)((-hx - g_ev.l) * sx), (LONG)((g_ev.up - hy) * sy), (LONG)((hx - g_ev.l) * sx), (LONG)((g_ev.up + hy) * sy) };
+        g_mirrorOk = SUCCEEDED(d->lpVtbl->StretchRect(d, bb, &src, g_mirror, nullptr, D3DTEXF_LINEAR));
+    }
+    if (g_mirrorOk) d->lpVtbl->StretchRect(d, g_mirror, nullptr, bb, nullptr, D3DTEXF_NONE);
+    bb->lpVtbl->Release(bb);
 }
 
 static void read_bb_size(IDirect3DDevice9* d) {
@@ -1525,7 +1558,6 @@ static void look_test(float* yaw, float* pitch) {
 //   8 s while it stays (a press while it still animates in is ignored);
 // - Backspace ("Wyjście") once, 10 s after the house shows up. Not repeated: the car looks the same.
 static int g_autoStage;  // 1 at the main menu, 2 in the house, 0 done or off
-static HWND g_gameWnd;
 
 static void auto_drive(unsigned draws, unsigned draws3d) {
     static double tStart = now_s(), tSince = tStart, tUp, tCar;
@@ -1606,6 +1638,7 @@ static void on_present(IDirect3DDevice9* d) {
         lastDraws = g_cnt[C_DRAW];
         last3d = n3d;
         submit_backbuffer(d);
+        if (!gpu_on()) mirror_eye(d);  // (D3D9On12 doesn't show the game on the desktop: skip_desktop)
         static bool prevKey;
         bool key = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
         if (key && !prevKey) vr_recenter();
