@@ -38,15 +38,6 @@ int vr_gpu_begin(int eye, int w, int h, int dxgiFormat, void** tex12);
 void vr_gpu_end(int eye, int slot, unsigned pair, const FramePose& pose, unsigned long long fenceValue);
 void* vr_gpu_newest(int eye);                                  // newest finished texture of an eye, or null
 
-// DXVK path (vk.cpp): eye images are DXVK's Vulkan images (TRANSFER_SRC_OPTIMAL when handed over),
-// submitted by the presenter on DXVK's queue between lock(ctx) and unlock(ctx).
-void vr_vk_init(void* instance, void* physDev, void* device, void* queue, unsigned queueFamily, void (*lock)(void*),
-                void (*unlock)(void*), void* ctx);
-int vr_vk_begin(int eye);  // a slot to fill, never one the presenter is showing; not shown until vr_vk_end
-// Commands filling the image are on DXVK's queue (flushed): the presenter may submit it.
-void vr_vk_end(int eye, int slot, unsigned long long image, int w, int h, unsigned vkFormat, unsigned pair, const FramePose& pose);
-void vr_vk_reset();        // forget all images; returns once the presenter is not submitting any
-
 // Sampling profiler (prof.cpp, TDUVR_PROFILE): off unless the variable is set.
 void prof_init();
 void prof_frame(bool inCar);

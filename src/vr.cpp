@@ -36,18 +36,6 @@ struct EyeChain { EyeBuf buf[3]; int write = 0, latest = 1, read = 2; bool fresh
 static EyeChain g_chain[2];
 static std::mutex g_mx;
 
-// DXVK path (vk.cpp): eye images are DXVK's Vulkan images, filled by the game thread and submitted by the
-// presenter on DXVK's queue under DXVK's queue lock; ordering on that one queue replaces fences. Slots
-// the presenter shows are never written.
-struct VkImg { unsigned long long image; int w, h; unsigned fmt, pair; FramePose pose; bool valid; };
-static VkImg g_vki[2][4];
-static vr::VRVulkanTextureData_t g_vkTex;  // device, queue...; image and size per submit
-static void (*g_vkLock)(void*);
-static void (*g_vkUnlock)(void*);
-static void* g_vkCtx;
-static volatile bool g_vkOn;
-static std::mutex g_vkSubmitMx;  // held by the presenter from picking our images to submitting them
-
 // Presenter thread state: the last few uploaded images per eye, so a left and a right image
 // from the same pair can always be found and shown together.
 struct GpuImg { ID3D11Texture2D* tex = nullptr; int w = 0, h = 0; unsigned pair = 0; FramePose pose{}; bool valid = false; };
@@ -86,9 +74,17 @@ static std::string game_dir() {
 
 // SecuROM's launcher process starts the real game as a child (/Sonydadc ...): the launcher
 // starts a fresh log, the child appends, every line tagged with the process id.
+// The launcher process (no /Sonydadc) starts a session's log; the game process it starts appends. The
+// previous session's log is kept as tdu_vr.prev.log, so a failed run survives one relaunch.
+static FILE* open_log() {
+    std::string p = game_dir() + "tdu_vr.log";
+    bool launcher = !strstr(GetCommandLineA(), "/Sonydadc");
+    if (launcher) MoveFileExA(p.c_str(), (game_dir() + "tdu_vr.prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
+    return _fsopen(p.c_str(), launcher ? "w" : "a", _SH_DENYNO);
+}
+
 void log_printf(const char* fmt, ...) {
-    static FILE* f = _fsopen((game_dir() + "tdu_vr.log").c_str(),
-                             strstr(GetCommandLineA(), "/Sonydadc") ? "a" : "w", _SH_DENYNO);
+    static FILE* f = open_log();
     if (!f) return;
     char buf[1024];
     va_list a;
@@ -154,29 +150,7 @@ static DWORD WINAPI presenter(void*) {
                 pairs++;
             }
         }
-        std::unique_lock<std::mutex> vkLk(g_vkSubmitMx, std::defer_lock);
-        VkImg vkShow[2];
-        bool vkSubmit = false;
-        if (g_vkOn) {
-            vkLk.lock();
-            std::lock_guard<std::mutex> lk(g_mx);
-            int bl = -1, br = -1;
-            for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) {
-                const VkImg &L = g_vki[0][i], &R = g_vki[1][j];
-                if (L.valid && R.valid && L.pair == R.pair && (bl < 0 || (int)(L.pair - g_vki[0][bl].pair) > 0)) { bl = i; br = j; }
-            }
-            if (bl >= 0 && (g_shown[0] < 0 || (int)(g_vki[0][bl].pair - g_vki[0][g_shown[0]].pair) > 0)) {
-                g_shown[0] = bl;
-                g_shown[1] = br;
-                pairs++;
-            }
-            if (g_shown[0] >= 0 && g_shown[1] >= 0) {
-                vkShow[0] = g_vki[0][g_shown[0]];
-                vkShow[1] = g_vki[1][g_shown[1]];
-                vkSubmit = vkShow[0].valid && vkShow[1].valid;
-            }
-        }
-        for (int e = 0; e < 2 && !g_d12 && !g_vkOn; e++) {
+        for (int e = 0; e < 2 && !g_d12; e++) {
             EyeChain& c = g_chain[e];
             bool fresh;
             {
@@ -219,7 +193,7 @@ static DWORD WINAPI presenter(void*) {
         }
         // Show the newest pair that both eyes have (both images share one head pose).
         int bl = -1, br = -1;
-        for (int i = 0; i < 3 && !g_d12 && !g_vkOn; i++) for (int j = 0; j < 3; j++) {
+        for (int i = 0; i < 3 && !g_d12; i++) for (int j = 0; j < 3; j++) {
             const GpuImg &L = g_img[0][i], &R = g_img[1][j];
             if (L.valid && R.valid && L.pair == R.pair && (bl < 0 || (int)(L.pair - g_img[0][bl].pair) > 0)) { bl = i; br = j; }
         }
@@ -230,29 +204,7 @@ static DWORD WINAPI presenter(void*) {
         }
         double t1 = now_s();
 
-        if (vkSubmit && !g_fake) {
-            if (g_vkLock) g_vkLock(g_vkCtx);  // DXVK submits nothing meanwhile; the compositor copies on its queue
-            for (int e = 0; e < 2; e++) {
-                vr::VRVulkanTextureData_t vt = g_vkTex;
-                vt.m_nImage = vkShow[e].image;
-                vt.m_nWidth = (uint32_t)vkShow[e].w;
-                vt.m_nHeight = (uint32_t)vkShow[e].h;
-                vt.m_nFormat = vkShow[e].fmt;
-                vt.m_nSampleCount = 1;
-                vr::VRTextureWithPose_t tex{};
-                tex.handle = &vt;
-                tex.eType = vr::TextureType_Vulkan;
-                tex.eColorSpace = vr::ColorSpace_Gamma;
-                memcpy(tex.mDeviceToAbsoluteTracking.m, vkShow[e].pose.m, sizeof vkShow[e].pose.m);
-                vr::VRTextureBounds_t bounds{ 0, 0, 1, 1 };
-                vr::EVRCompositorError err = vr::VRCompositor()->Submit((vr::EVREye)e, &tex, &bounds, vr::Submit_TextureWithPose);
-                static int errors;
-                if (err != vr::VRCompositorError_None && errors++ < 10) log_printf("Submit eye %d (Vulkan) error %d\n", e, err);
-            }
-            if (g_vkUnlock) g_vkUnlock(g_vkCtx);
-        }
-        if (vkLk.owns_lock()) vkLk.unlock();
-        if (g_shown[0] >= 0 && g_shown[1] >= 0 && !g_fake && !g_vkOn) {
+        if (g_shown[0] >= 0 && g_shown[1] >= 0 && !g_fake) {
             for (int e = 0; e < 2; e++) {
                 vr::VRTextureWithPose_t tex{};
                 vr::D3D12TextureData_t d12{};
@@ -357,47 +309,6 @@ void vr_gpu_end(int eye, int slot, unsigned pair, const FramePose& pose, unsigne
     g_stUploads++;
 }
 
-void vr_vk_init(void* instance, void* physDev, void* device, void* queue, unsigned queueFamily, void (*lock)(void*),
-                void (*unlock)(void*), void* ctx) {
-    g_vkTex = vr::VRVulkanTextureData_t{};
-    g_vkTex.m_pInstance = (VkInstance_T*)instance;
-    g_vkTex.m_pPhysicalDevice = (VkPhysicalDevice_T*)physDev;
-    g_vkTex.m_pDevice = (VkDevice_T*)device;
-    g_vkTex.m_pQueue = (VkQueue_T*)queue;
-    g_vkTex.m_nQueueFamilyIndex = queueFamily;
-    g_vkLock = lock;
-    g_vkUnlock = unlock;
-    g_vkCtx = ctx;
-    MemoryBarrier();
-    g_vkOn = true;  // last: the running presenter switches to the Vulkan path on seeing it
-}
-
-int vr_vk_begin(int eye) {
-    std::lock_guard<std::mutex> lk(g_mx);
-    int s = -1;
-    for (int i = 0; i < 4; i++) {  // the oldest slot not on screen
-        if (i == g_shown[eye]) continue;
-        const VkImg &a = g_vki[eye][i], &b = g_vki[eye][s < 0 ? i : s];
-        if (s < 0 || !a.valid || (b.valid && (int)(a.pair - b.pair) < 0)) s = i;
-    }
-    g_vki[eye][s].valid = false;  // being written: not shown until vr_vk_end
-    return s;
-}
-
-void vr_vk_end(int eye, int slot, unsigned long long image, int w, int h, unsigned vkFormat, unsigned pair, const FramePose& pose) {
-    std::lock_guard<std::mutex> lk(g_mx);
-    g_vki[eye][slot] = VkImg{ image, w, h, vkFormat, pair, pose, image != 0 };
-    g_stUploads++;
-}
-
-void vr_vk_reset() {
-    std::lock_guard<std::mutex> sk(g_vkSubmitMx);  // waits for a submit in progress
-    std::lock_guard<std::mutex> lk(g_mx);
-    for (auto& e : g_vki)
-        for (auto& v : e) v = VkImg{};
-    g_shown[0] = g_shown[1] = -1;
-}
-
 void* vr_gpu_newest(int eye) {
     std::lock_guard<std::mutex> lk(g_mx);
     int b = -1;
@@ -478,7 +389,7 @@ void vr_begin_frame(int eye, bool newPair, float maxYaw, float maxPitch, float t
     if (newPair) {
         // Predict for when this pair reaches the eyes: both eyes rendered (+ one frame readback lag on
         // the CPU path) + presenter pickup + photons. The compositor corrects the rest from the tagged pose.
-        float predict = (float)((g_d12 || g_vkOn ? 2 : 3) * g_frameDt) + 0.5f / g_freq + g_v2p;
+        float predict = (float)((g_d12 ? 2 : 3) * g_frameDt) + 0.5f / g_freq + g_v2p;
         vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
         bool valid = true;  // TDUVR_NOHMD: the head stays where it is (or moves with TDUVR_FAKEHEAD)
         if (g_sys) {

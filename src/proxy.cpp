@@ -1107,6 +1107,7 @@ static void submit_backbuffer(IDirect3DDevice9* d) {
         double t = now_s();
         bool done = vk_capture(d, g_eye, g_frame >> 1, g_framePose);
         g_readbackMs += (now_s() - t) * 1000;
+        if (done && g_eye == 0 && dump_due()) vk_read_eye(1, write_bmp);  // the pair just bridged
         if (done) return;
     }
     if (gpu_on()) {
